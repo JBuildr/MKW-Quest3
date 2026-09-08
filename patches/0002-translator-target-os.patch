@@ -1,0 +1,166 @@
+diff --git a/translator/src/Translator.Cli/Program.cs b/translator/src/Translator.Cli/Program.cs
+index 9eee788..38975ef 100644
+--- a/translator/src/Translator.Cli/Program.cs
++++ b/translator/src/Translator.Cli/Program.cs
+@@ -38,7 +38,20 @@ CultureInfo.DefaultThreadCurrentUICulture = CultureInfo.InvariantCulture;
+ 
+ var command = args.Length > 0 ? args[0] : "info";
+ var (projectOption, tailWithoutProject) = ExtractOption(args.Skip(1).ToArray(), "--project");
+-var (profileOption, tail) = ExtractOption(tailWithoutProject, "--profile");
++var (targetOsOption, tailWithoutTargetOs) = ExtractOption(tailWithoutProject, "--target-os");
++// Emitted assembly is object-file specific. Without this it is guessed from the
++// host, which is wrong for a cross build (Android arm64 assembled on Windows).
++if (!string.IsNullOrWhiteSpace(targetOsOption))
++{
++    if (!AssemblyTarget.TryParse(targetOsOption, out var assemblyTarget))
++    {
++        Console.Error.WriteLine(
++            $"Unknown --target-os '{targetOsOption}' (expected windows, macos, linux or android).");
++        return 1;
++    }
++    AssemblyTarget.Current = assemblyTarget;
++}
++var (profileOption, tail) = ExtractOption(tailWithoutTargetOs, "--profile");
+ var project = !string.IsNullOrWhiteSpace(projectOption)
+     ? TranslationProjectConfig.Load(projectOption)
+     : null;
+@@ -3656,7 +3669,7 @@ static void WriteUsage(TextWriter writer, IReadOnlyList<string> commands)
+     {
+         writer.WriteLine(CommandUsage(name));
+     }
+-    writer.WriteLine("Every command also accepts [--project path] [--profile name] [--prefer-cached-inputs] [--help].");
++    writer.WriteLine("Every command also accepts [--project path] [--profile name] [--target-os windows|macos|linux|android] [--prefer-cached-inputs] [--help].");
+ }
+ 
+ static string[] KnownCommands() => new[]
+@@ -3756,7 +3769,7 @@ static string CommandUsage(string command)
+ 
+ // Options every command tolerates. --project and --profile are consumed before
+ // dispatch, so they only reach a command's tail when they were repeated.
+-static string[] GlobalValueOptions() => new[] { "--project", "--profile" };
++static string[] GlobalValueOptions() => new[] { "--project", "--profile", "--target-os" };
+ 
+ static string[] GlobalFlagOptions() => new[] { "--prefer-cached-inputs" };
+ 
+diff --git a/translator/src/Translator.Core/IO/AssemblyBlobWriter.cs b/translator/src/Translator.Core/IO/AssemblyBlobWriter.cs
+index 2201e54..38bd570 100644
+--- a/translator/src/Translator.Core/IO/AssemblyBlobWriter.cs
++++ b/translator/src/Translator.Core/IO/AssemblyBlobWriter.cs
+@@ -22,15 +22,17 @@ internal static class AssemblyBlobWriter
+         var expectedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+         var assembly = new StringBuilder();
+         foreach (var header in headerLines) assembly.AppendLine(header);
+-        // PE/COFF (Windows), Mach-O (macOS), and ELF (Linux) spell a read-only data section
+-        // differently in GNU-as syntax. The build always targets
+-        // whichever platform the translator itself runs on (there is no cross-compilation
+-        // support), so that's what this picks the section syntax from.
+-        assembly.AppendLine(OperatingSystem.IsWindows()
+-            ? ".section .rdata,\"dr\""
+-            : OperatingSystem.IsMacOS()
+-                ? ".section __TEXT,__const"
+-                : ".section .rodata,\"a\",@progbits");
++        // PE/COFF (Windows), Mach-O (macOS), and ELF (Linux/Android) spell a read-only data
++        // section differently in GNU-as syntax. The target used to be assumed to be the
++        // machine the translator runs on; AssemblyTarget keeps that as the default but lets a
++        // cross build say otherwise (--target-os).
++        var target = AssemblyTarget.Current;
++        assembly.AppendLine(target switch
++        {
++            AssemblyTargetPlatform.Windows => ".section .rdata,\"dr\"",
++            AssemblyTargetPlatform.MacOS => ".section __TEXT,__const",
++            _ => ".section .rodata,\"a\",@progbits",
++        });
+         assembly.AppendLine();
+ 
+         foreach (var blob in blobs)
+@@ -44,7 +46,7 @@ internal static class AssemblyBlobWriter
+             // C/C++ external symbols carry a leading underscore in Mach-O,
+             // unlike ELF and COFF.  The generated C++ still names the symbol
+             // without that ABI decoration, so emit the platform spelling here.
+-            var assemblySymbol = OperatingSystem.IsMacOS() ? $"_{blob.Symbol}" : blob.Symbol;
++            var assemblySymbol = target == AssemblyTargetPlatform.MacOS ? $"_{blob.Symbol}" : blob.Symbol;
+             assembly.AppendLine($".globl {assemblySymbol}");
+             assembly.AppendLine($"{assemblySymbol}:");
+             var referencePath = Path.Combine(blobReferenceDirectory, blob.FileName);
+@@ -56,7 +58,7 @@ internal static class AssemblyBlobWriter
+         {
+             if (!expectedFiles.Contains(Path.GetFullPath(stalePath))) File.Delete(stalePath);
+         }
+-        if (!OperatingSystem.IsWindows() && !OperatingSystem.IsMacOS())
++        if (target == AssemblyTargetPlatform.Elf)
+         {
+             // Absence of a .note.GNU-stack section makes the linker assume the oldest, most
+             // conservative default for this object (an executable stack) and warn about it; this
+diff --git a/translator/src/Translator.Core/IO/AssemblyTargetPlatform.cs b/translator/src/Translator.Core/IO/AssemblyTargetPlatform.cs
+new file mode 100644
+index 0000000..1bcdbd4
+--- /dev/null
++++ b/translator/src/Translator.Core/IO/AssemblyTargetPlatform.cs
+@@ -0,0 +1,67 @@
++using System;
++
++namespace Translator.Core.IO;
++
++/// <summary>
++/// The object-file flavour the emitted assembly has to speak. PE/COFF, Mach-O
++/// and ELF spell sections and symbol decoration differently in GNU-as syntax.
++/// </summary>
++public enum AssemblyTargetPlatform
++{
++    Windows,
++    MacOS,
++    Elf,
++}
++
++/// <summary>
++/// Which object-file flavour <see cref="AssemblyBlobWriter"/> emits for.
++/// <para>
++/// This used to be read straight off the machine the translator runs on,
++/// because a build always targeted its own host. Cross-compiling breaks that:
++/// the Android arm64 build is produced on a Windows host, and a
++/// <c>.section .rdata,"dr"</c> emitted there is rejected by the NDK assembler,
++/// which wants ELF. The host stays the default, so nothing changes for a
++/// native build; a cross build states its target instead of being guessed at.
++/// </para>
++/// </summary>
++public static class AssemblyTarget
++{
++    public static AssemblyTargetPlatform Current { get; set; } = Host;
++
++    public static AssemblyTargetPlatform Host =>
++        OperatingSystem.IsWindows() ? AssemblyTargetPlatform.Windows
++        : OperatingSystem.IsMacOS() ? AssemblyTargetPlatform.MacOS
++        : AssemblyTargetPlatform.Elf;
++
++    /// <summary>
++    /// Accepts the names a caller would reach for. Android and Linux are the
++    /// same answer here: both are ELF, and the difference between bionic and
++    /// glibc never reaches an assembler directive.
++    /// </summary>
++    public static bool TryParse(string? value, out AssemblyTargetPlatform platform)
++    {
++        switch (value?.Trim().ToLowerInvariant())
++        {
++            case "windows":
++            case "win":
++            case "pe":
++            case "coff":
++                platform = AssemblyTargetPlatform.Windows;
++                return true;
++            case "macos":
++            case "osx":
++            case "darwin":
++            case "macho":
++                platform = AssemblyTargetPlatform.MacOS;
++                return true;
++            case "linux":
++            case "android":
++            case "elf":
++                platform = AssemblyTargetPlatform.Elf;
++                return true;
++            default:
++                platform = Host;
++                return false;
++        }
++    }
++}

@@ -1,0 +1,1996 @@
+--- a/aurora-main/lib/gx/shader.cpp
++++ b/aurora-main/lib/gx/shader.cpp
+@@ -674,6 +674,105 @@
+   return fmt::format("({} + {}u)", offs, add);
+ }
+ 
++// `array_start` is declared as array<vec4u, 3> rather than array<u32, 12>: WGSL
++// requires uniform-address-space array strides to be multiples of 16 unless the
++// device offers the uniform_buffer_standard_layout language feature, and with
++// skip_validation nothing enforces that. Desktop drivers honoured the stride-4
++// decoration anyway; on the Adreno 740 (Quest 3) indexed 3D geometry came out as
++// garbage while direct-data 2D drew fine, and this layout is the one thing in
++// the vertex path that only indexed attributes touch. Packing four bases per
++// vec4u is valid WGSL everywhere and keeps the byte layout the CPU stages (12
++// consecutive u32) unchanged.
++auto array_start_expr(u32 arrayIndex) -> std::string {
++  return fmt::format("ubuf.array_start[{}][{}]", arrayIndex / 4u, arrayIndex % 4u);
++}
++
++// ---- Word-wise direct-attribute loads (Quest-3 workaround) ----
++// Every draw that does not merge starts 4-byte aligned (gfx::align_verts), so for a stride that
++// is a multiple of 4 every vertex base `ubuf.vtx_start + vidx * stride` is aligned and each
++// attribute's byte offset is a compile-time constant. Components that fit in one word are then
++// read as p[i] plus constant shifts; a component that would straddle a word (only possible in
++// game-provided direct formats with odd offsets) falls back to the byte-wise loads.
++static bool aligned_direct(const ShaderConfig& config, const AttrConfig& mapping) {
++  return mapping.attrType == GX_DIRECT && config.vtxStride % 4 == 0;
++}
++
++static bool fits_in_word(u32 byteOffset, u32 bytes) { return (byteOffset & 3u) + bytes <= 4; }
++
++static std::string aligned_word(std::string_view base, u32 byteOffset) {
++  return fmt::format("aw(&vbuf, {})", offset_plus(base, byteOffset & ~3u));
++}
++
++static std::string aligned_scalar(u8 compType, std::string_view base, u32 byteOffset) {
++  const u32 sub = byteOffset & 3u;
++  const auto w = aligned_word(base, byteOffset);
++  switch (static_cast<GXCompType>(compType)) {
++  case GX_U8:
++    return fmt::format("f32(al_u8({}, {}u))", w, sub);
++  case GX_S8:
++    return fmt::format("f32(al_s8({}, {}u))", w, sub);
++  case GX_U16:
++    return fmt::format("f32(al_u16({}, {}u))", w, sub);
++  case GX_S16:
++    return fmt::format("f32(al_s16({}, {}u))", w, sub);
++  case GX_F32:
++    return fmt::format("bitcast<f32>(bswap32({}, false))", w);
++  default:
++    Log.fatal("aligned_scalar: Unimplemented {}", static_cast<GXCompType>(compType));
++  }
++}
++
++// Empty when the attribute cannot be read word-wise.
++static std::string fetch_attr_aligned(const AttrConfig& mapping, std::string_view base, u32 byteOffset,
++                                      u8 cntOverride = 0) {
++  const u8 cnt = cntOverride != 0 ? cntOverride : mapping.cnt;
++  if (mapping.compType == GX_RGBA8) {
++    return fits_in_word(byteOffset, 4) ? fmt::format("unpack4x8unorm({})", aligned_word(base, byteOffset)) : ""s;
++  }
++  const u32 compSize = attr_comp_type_size(mapping.compType);
++  std::string comps;
++  for (u32 i = 0; i < cnt; ++i) {
++    const u32 off = byteOffset + i * compSize;
++    if (!fits_in_word(off, compSize)) {
++      return ""s;
++    }
++    if (i != 0) {
++      comps += ", ";
++    }
++    comps += aligned_scalar(mapping.compType, base, off);
++  }
++  std::string value = cnt == 1 ? comps : fmt::format("vec{}f({})", cnt, comps);
++  if (mapping.compType != GX_F32) {
++    value = fmt::format("({} / f32(1u << {}u))", value, mapping.frac);
++  }
++  return value;
++}
++
++static std::string fetch_color_attr_aligned(const AttrConfig& mapping, std::string_view base, u32 byteOffset) {
++  const u32 sub = byteOffset & 3u;
++  const auto w = aligned_word(base, byteOffset);
++  const auto bytes4 = fmt::format("vec4u(al_u8({0}, 0u), al_u8({0}, 1u), al_u8({0}, 2u), al_u8({0}, 3u))", w);
++  switch (static_cast<GXCompType>(mapping.compType)) {
++  case GX_RGB565:
++    return fits_in_word(byteOffset, 2) ? fmt::format("unpack_rgb565(al_u16({}, {}u))", w, sub) : ""s;
++  case GX_RGBA4:
++    return fits_in_word(byteOffset, 2) ? fmt::format("unpack_rgba4(al_u16({}, {}u))", w, sub) : ""s;
++  case GX_RGB8:
++    return fits_in_word(byteOffset, 3)
++               ? fmt::format("unpack_rgb8(vec3u(al_u8({0}, {1}u), al_u8({0}, {2}u), al_u8({0}, {3}u)))", w, sub,
++                             sub + 1, sub + 2)
++               : ""s;
++  case GX_RGBA6:
++    return fits_in_word(byteOffset, 3) ? fmt::format("unpack_rgba6(al_u24({}, {}u))", w, sub) : ""s;
++  case GX_RGBX8:
++    return fits_in_word(byteOffset, 4) ? fmt::format("unpack_rgbx8({})", bytes4) : ""s;
++  case GX_RGBA8:
++    return fits_in_word(byteOffset, 4) ? fmt::format("unpack_rgba8({})", bytes4) : ""s;
++  default:
++    Log.fatal("fetch_color_attr_aligned: Unimplemented {}", static_cast<GXCompType>(mapping.compType));
++  }
++}
++
+ auto normal_group_load(const ShaderConfig& config, u8 group, std::string_view vidx) -> std::string {
+   const auto& mapping = config.attrs[GX_VA_NRM];
+   if (mapping.attrType == GX_NONE || mapping.cnt != 9) {
+@@ -689,17 +788,24 @@
+ 
+   if (mapping.attrType == GX_INDEX8) {
+     const std::string indexOffs = offset_plus(offs, mapping.nrmIndexCount == 3 ? group : 0);
+-    offs = fmt::format("ubuf.array_start[{}] + raw_fetch_u8_1(&{}, {}) * {}u + {}u", GX_VA_NRM - GX_VA_POS, buf,
++    offs = fmt::format("{} + raw_fetch_u8_1(&{}, {}) * {}u + {}u", array_start_expr(GX_VA_NRM - GX_VA_POS), buf,
+                        indexOffs, mapping.stride, groupOffset);
+     buf = "abuf"sv;
+     le = mapping.le;
+   } else if (mapping.attrType == GX_INDEX16) {
+     const std::string indexOffs = offset_plus(offs, mapping.nrmIndexCount == 3 ? group * 2u : 0);
+-    offs = fmt::format("ubuf.array_start[{}] + raw_fetch_u16_1(&{}, {}, {}) * {}u + {}u", GX_VA_NRM - GX_VA_POS,
++    offs = fmt::format("{} + raw_fetch_u16_1(&{}, {}, {}) * {}u + {}u", array_start_expr(GX_VA_NRM - GX_VA_POS),
+                        buf, indexOffs, le, mapping.stride, groupOffset);
+     buf = "abuf"sv;
+     le = mapping.le;
+   } else {
++    if (aligned_direct(config, mapping)) {
++      const auto base = fmt::format("ubuf.vtx_start + {} * {}u", vidx, config.vtxStride);
++      const auto value = fetch_attr_aligned(mapping, base, mapping.offset + groupOffset, 3);
++      if (!value.empty()) {
++        return value;
++      }
++    }
+     offs = offset_plus(offs, groupOffset);
+   }
+ 
+@@ -711,16 +817,59 @@
+   if (mapping.attrType == GX_NONE) {
+     return vtx_attr(config, attr);
+   }
++  if (aligned_direct(config, mapping)) {
++    const auto base = fmt::format("ubuf.vtx_start + {} * {}u", vidx, config.vtxStride);
++    const u32 sub = mapping.offset & 3u;
++    std::string value;
++    switch (attr) {
++    case GX_VA_PNMTXIDX:
++      return fmt::format("(al_u8({}, {}u) / 3u)", aligned_word(base, mapping.offset), sub);
++    case GX_VA_TEX0MTXIDX:
++    case GX_VA_TEX1MTXIDX:
++    case GX_VA_TEX2MTXIDX:
++    case GX_VA_TEX3MTXIDX:
++    case GX_VA_TEX4MTXIDX:
++    case GX_VA_TEX5MTXIDX:
++    case GX_VA_TEX6MTXIDX:
++    case GX_VA_TEX7MTXIDX:
++      return fmt::format("al_u8({}, {}u)", aligned_word(base, mapping.offset), sub);
++    case GX_VA_POS:
++      value = fetch_attr_aligned(mapping, base, mapping.offset);
++      if (!value.empty()) {
++        return mapping.cnt == 2 ? fmt::format("vec3f({}, 0.0)", value) : value;
++      }
++      break;
++    case GX_VA_NRM:
++      value = fetch_attr_aligned(mapping, base, mapping.offset, mapping.cnt == 9 ? 3 : 0);
++      if (!value.empty()) {
++        return value;
++      }
++      break;
++    case GX_VA_CLR0:
++    case GX_VA_CLR1:
++      value = fetch_color_attr_aligned(mapping, base, mapping.offset);
++      if (!value.empty()) {
++        return value;
++      }
++      break;
++    default:
++      value = fetch_attr_aligned(mapping, base, mapping.offset);
++      if (!value.empty()) {
++        return mapping.cnt == 1 ? fmt::format("vec2f({}, 0.0)", value) : value;
++      }
++      break;
++    }
++  }
+   auto buf = "vbuf"sv;
+   auto offs = fmt::format("ubuf.vtx_start + {} * {}u + {}u", vidx, config.vtxStride, mapping.offset);
+   auto le = false; // Vertex buffer is always big endian (for now)
+   if (mapping.attrType == GX_INDEX8) {
+-    offs = fmt::format("ubuf.array_start[{}] + raw_fetch_u8_1(&{}, {}) * {}u", attr - GX_VA_POS, buf, offs,
++    offs = fmt::format("{} + raw_fetch_u8_1(&{}, {}) * {}u", array_start_expr(attr - GX_VA_POS), buf, offs,
+                        mapping.stride);
+     buf = "abuf"sv;
+     le = mapping.le;
+   } else if (mapping.attrType == GX_INDEX16) {
+-    offs = fmt::format("ubuf.array_start[{}] + raw_fetch_u16_1(&{}, {}, {}) * {}u", attr - GX_VA_POS, buf, offs, le,
++    offs = fmt::format("{} + raw_fetch_u16_1(&{}, {}, {}) * {}u", array_start_expr(attr - GX_VA_POS), buf, offs, le,
+                        mapping.stride);
+     buf = "abuf"sv;
+     le = mapping.le;
+@@ -892,6 +1041,31 @@
+                      outputValue);
+ }
+ 
++static std::string load_f32_source() {
++  return R"""(fn load_f32(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> f32 {
++  return bitcast<f32>(load_u32(p, byte_off, le));
++})""";
++}
++
++static std::string load_u8_source() {
++  return R"""(fn load_u8(p: ptr<storage, array<u32>>, byte_off: u32) -> u32 {
++  let word = p[byte_off / 4u];
++  let shift = (byte_off & 3u) * 8u;
++  return (word >> shift) & 0xFFu;
++})""";
++}
++
++static std::string load_u16_source() {
++  return R"""(fn load_u16(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> u32 {
++  let b0 = load_u8(p, byte_off);
++  let b1 = load_u8(p, byte_off + 1u);
++  if (le) {
++    return b0 | (b1 << 8u);
++  }
++  return (b0 << 8u) | b1;
++})""";
++}
++
+ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
+   ZoneScoped;
+   const auto hash = xxh3_hash(config);
+@@ -906,6 +1080,22 @@
+   std::string vtxXfrAttrs;
+   size_t vtxOutIdx = 0;
+ 
++  // Position/normal matrix transforms. The uniform holds the matrices as plain vec4f rows
++  // (postex_rows / nrm_rows, three rows per GX matrix, byte layout identical to the
++  // Mat3x4<float> the CPU stages) and the transform is three dot products with a clamped
++  // dynamic row index: no array<mat3x4f>, no per-vertex index into an array of matrices,
++  // no switch, no function that returns a matrix. This is Dolphin's layout (float4
++  // ctrmtx[64]) and the workaround Quest-2 developers documented for the Adreno 650;
++  // Qualcomm's compiler is documented to mishandle non-constant indexing of uniform
++  // matrix arrays in vertex shaders, which is exactly what only the multi-matrix draws do.
++  // (The Adreno 740 turned out to fail elsewhere; the row layout stays.)
++  const auto postex_xf = [&](std::string_view point, std::string_view index) {
++    return fmt::format("postex_xf({}, {})", point, index);
++  };
++  const auto nrm_xf = [&](std::string_view normal, std::string_view index) {
++    return fmt::format("nrm_xf({}, {})", normal, index);
++  };
++
+   // Load points for line/point expansion
+   std::string_view vidxAttr = "vidx"sv;
+   if (config.lineMode != 0) {
+@@ -921,8 +1111,9 @@
+           "\n    let in_vidx = iidx;"
+           "\n    let in_pos = {};"
+           "\n    let in_pnmtxidx = {};"
+-          "\n    let mv_pos = vec4f(in_pos, 1.0) * ubuf.postex_mtx[in_pnmtxidx];",
+-          attr_load(config, GX_VA_POS, "in_vidx"sv), attr_load(config, GX_VA_PNMTXIDX, "in_vidx"sv));
++          "\n    let mv_pos = {};",
++          attr_load(config, GX_VA_POS, "in_vidx"sv), attr_load(config, GX_VA_PNMTXIDX, "in_vidx"sv),
++          postex_xf("vec4f(in_pos, 1.0)", "in_pnmtxidx"));
+     } else {
+       // GX_LINES / GX_LINESTRIP: each instance = two vertices, expand to quad
+       vtxXfrAttrsPre += fmt::format(
+@@ -936,17 +1127,29 @@
+           "\n    let pnmtxidx_a = {};"
+           "\n    let pnmtxidx_b = {};"
+           "\n    let in_pnmtxidx = select(pnmtxidx_a, pnmtxidx_b, use_b);"
+-          "\n    let mv_pos_a = vec4f(pos_a, 1.0) * ubuf.postex_mtx[pnmtxidx_a];"
+-          "\n    let mv_pos_b = vec4f(pos_b, 1.0) * ubuf.postex_mtx[pnmtxidx_b];"
++          "\n    let mv_pos_a = {};"
++          "\n    let mv_pos_b = {};"
+           "\n    let mv_pos = select(mv_pos_a, mv_pos_b, use_b);",
+           config.lineMode == 1 ? 2 : 1, attr_load(config, GX_VA_POS, "vidx_a"sv),
+           attr_load(config, GX_VA_POS, "vidx_b"sv), attr_load(config, GX_VA_PNMTXIDX, "vidx_a"sv),
+-          attr_load(config, GX_VA_PNMTXIDX, "vidx_b"sv));
++          attr_load(config, GX_VA_PNMTXIDX, "vidx_b"sv), postex_xf("vec4f(pos_a, 1.0)", "pnmtxidx_a"),
++          postex_xf("vec4f(pos_b, 1.0)", "pnmtxidx_b"));
+     }
+     vidxAttr = "in_vidx"sv;
+   } else if (config.attrs[GX_VA_PNMTXIDX].attrType == GX_NONE) {
+     vtxXfrAttrsPre += "\n    let in_pnmtxidx = ubuf.current_pnmtx;";
+   }
++  // Quest-3 diagnostics (AURORA_GX_DEBUG bits 1 and 2): the per-vertex position-matrix index
++  // is not fetched; the draw's current matrix is used instead. With bit 2 the uniform layout
++  // is compact and build_uniform writes 0 into current_pnmtx, with bit 1 the layout keeps all
++  // ten position matrices and the real current index is used. Skinned models then render
++  // rigid but intact if only the per-vertex index (or its use) is what the Adreno gets wrong.
++  const bool debugConstantPnMtx =
++      config.lineMode == 0 && config.attrs[GX_VA_PNMTXIDX].attrType != GX_NONE &&
++      (gx_debug_flags() & (GxDebugIgnorePerVertexPnMtx | GxDebugCompactMatrixLayout)) != 0;
++  if (debugConstantPnMtx) {
++    vtxXfrAttrsPre += "\n    let in_pnmtxidx = ubuf.current_pnmtx; // AURORA_GX_DEBUG";
++  }
+ 
+   // Load vertex attributes
+   for (GXAttr attr = GX_VA_PNMTXIDX; attr <= GX_VA_TEX7; attr = static_cast<GXAttr>(attr + 1)) {
+@@ -954,6 +1157,9 @@
+     if (attrType == GX_NONE) {
+       continue;
+     }
++    if (attr == GX_VA_PNMTXIDX && debugConstantPnMtx) {
++      continue;
++    }
+     // in_pnmtxidx and in_pos written above for line mode
+     if ((attr != GX_VA_PNMTXIDX && attr != GX_VA_POS) || config.lineMode == 0) {
+       vtxXfrAttrsPre += fmt::format("\n    let {} = {};", vtx_attr(config, attr), attr_load(config, attr, vidxAttr));
+@@ -962,9 +1168,9 @@
+ 
+   if (config.lineMode == 0) {
+     vtxXfrAttrsPre += fmt::format(
+-        "\n    let mv_pos = vec4f({}, 1.0) * ubuf.postex_mtx[in_pnmtxidx];"
++        "\n    let mv_pos = {};"
+         "\n    out.pos = vec4f(mv_pos, 1.0) * ubuf.proj;",
+-        vtx_attr(config, GX_VA_POS));
++        postex_xf(fmt::format("vec4f({}, 1.0)", vtx_attr(config, GX_VA_POS)), "in_pnmtxidx"));
+   } else if (config.lineMode == 3) {
+     // GX_POINTS: expand single vertex to axis-aligned screen-space square
+     vtxXfrAttrsPre +=
+@@ -1004,14 +1210,28 @@
+       "vec2f(-1.0, 1.0) / (6.0 * max(abs(ubuf.render_viewport_size), vec2f(1.0)));"
+       "\n    out.pos = vec4f(out.pos.xy + out.pos.w * gx_pixel_center_correction, out.pos.zw);";
+   vtxXfrAttrsPre += fmt::format(
+-      "\n    let nrm_tmp = vec4f({}, 0.0) * ubuf.nrm_mtx[in_pnmtxidx];"
++      "\n    let nrm_tmp = {};"
+       "\n    let mv_nrm = select(nrm_tmp, normalize(nrm_tmp), dot(nrm_tmp, nrm_tmp) > 1e-10);",
+-      vtx_attr(config, GX_VA_NRM));
++      nrm_xf(fmt::format("vec4f({}, 0.0)", vtx_attr(config, GX_VA_NRM)), "in_pnmtxidx"));
+ 
+   uniBufAttrs += "\n    proj: mat4x4f,";
+   // Only the matrix slots this shader can read are uploaded, in compacted order; see UniformMatrixLayout.
+-  uniBufAttrs += fmt::format("\n    postex_mtx: array<mat3x4f, {}>,", info.matrixLayout.postexCount);
+-  uniBufAttrs += fmt::format("\n    nrm_mtx: array<mat3x4f, {}>,", info.matrixLayout.nrmCount);
++  {
++    // Three vec4f rows per matrix: WGSL mat3x4f column c and Mat3x4<float> row c occupy the same 16 bytes,
++    // and (v * M)[c] == dot(v, column c), so the row form is bit-identical to the matrix product.
++    uniBufAttrs += fmt::format("\n    postex_rows: array<vec4f, {}>,", 3u * info.matrixLayout.postexCount);
++    uniBufAttrs += fmt::format("\n    nrm_rows: array<vec4f, {}>,", 3u * info.matrixLayout.nrmCount);
++    const auto emitRowTransform = [&](std::string_view name, std::string_view rows, u32 count) {
++      uniformPre += fmt::format(
++          "\nfn {0}(p: vec4f, i: u32) -> vec3f {{"
++          "\n  let b = min(i, {2}u) * 3u;"
++          "\n  return vec3f(dot(p, ubuf.{1}[b]), dot(p, ubuf.{1}[b + 1u]), dot(p, ubuf.{1}[b + 2u]));"
++          "\n}}\n",
++          name, rows, count == 0 ? 0u : count - 1);
++    };
++    emitRowTransform("postex_xf", "postex_rows", info.matrixLayout.postexCount);
++    emitRowTransform("nrm_xf", "nrm_rows", info.matrixLayout.nrmCount);
++  }
+   std::string fragmentFnPre;
+   std::string fragmentFn;
+   const int zTexStage = tev_z_texture_stage(config);
+@@ -1193,7 +1413,8 @@
+     }
+     if (tcg.type == GX_TG_MTX2x4 || tcg.type == GX_TG_MTX3x4) {
+       if (info.indexAttr.test(GX_VA_TEX0MTXIDX + i)) {
+-        vtxXfrAttrs += fmt::format("\n    var tc{0}_tmp = tc{0} * ubuf.postex_mtx[in_texmtxidx{0} / 3u];", i);
++        vtxXfrAttrs += fmt::format("\n    var tc{0}_tmp = {1};", i,
++                                   postex_xf(fmt::format("tc{}", i), fmt::format("in_texmtxidx{} / 3u", i)));
+       } else if (tcg.mtx == GX_IDENTITY) {
+         vtxXfrAttrs += fmt::format("\n    var tc{0}_tmp = tc{0}.xyz;", i);
+       } else {
+@@ -1202,7 +1423,8 @@
+                                                         : texMtxSlot;
+         CHECK(texMtxIdx != UniformMatrixLayout::kAbsent,
+               "texgen {} matrix slot {} missing from the uniform layout", i, texMtxSlot);
+-        vtxXfrAttrs += fmt::format("\n    var tc{0}_tmp = tc{0} * ubuf.postex_mtx[{1}];", i, texMtxIdx);
++        vtxXfrAttrs += fmt::format("\n    var tc{0}_tmp = {1};", i,
++                                   postex_xf(fmt::format("tc{}", i), fmt::format("{}u", texMtxIdx)));
+       }
+       if (tcg.type == GX_TG_MTX2x4) {
+         vtxXfrAttrs += fmt::format("\n    tc{0}_tmp.z = 1.0f;", i);
+@@ -1663,12 +1885,44 @@
+   return select(((v & 0xFFu) << 8u) | (v >> 8u), v, le);
+ }}
+ 
+-fn load_u8(p: ptr<storage, array<u32>>, byte_off: u32) -> u32 {{
+-  let word = p[byte_off / 4u];
+-  let shift = (byte_off & 3u) * 8u;
+-  return (word >> shift) & 0xFFu;
++// Word-wise direct-attribute loads (Quest-3 workaround). `byte_off` is a
++// multiple of 4 and `sub` a compile-time constant: every value comes out of one word p[i] and no
++// load ever combines two adjacent words, which the Adreno 740 gets wrong.
++fn aw(p: ptr<storage, array<u32>>, byte_off: u32) -> u32 {{
++  return p[byte_off >> 2u];
++}}
++
++fn al_u8(w: u32, sub: u32) -> u32 {{
++  return (w >> (sub * 8u)) & 0xFFu;
++}}
++
++fn al_s8(w: u32, sub: u32) -> i32 {{
++  return (bitcast<i32>(al_u8(w, sub)) << 24) >> 24;
++}}
++
++fn al_u16(w: u32, sub: u32) -> u32 {{
++  return (al_u8(w, sub) << 8u) | al_u8(w, sub + 1u);
++}}
++
++fn al_s16(w: u32, sub: u32) -> i32 {{
++  return (bitcast<i32>(al_u16(w, sub)) << 16) >> 16;
++}}
++
++fn al_u24(w: u32, sub: u32) -> u32 {{
++  return (al_u8(w, sub) << 16u) | (al_u8(w, sub + 1u) << 8u) | al_u8(w, sub + 2u);
++}}
++
++// Shift-and-mask stand-in for the extractBits builtin. The Adreno 740 driver on the
++// Quest 3 is suspected of returning wrong values from extractBits with a runtime offset:
++// every misaligned 16-bit and multi-byte load below (GX_INDEX16 vertex indices most
++// visibly), while the shift-based load_u8 next to them was fine. Offsets here are
++// at most 24 and counts are 8 or 16, so no shift ever reaches 32.
++fn bits(v: u32, off: u32, count: u32) -> u32 {{
++  return (v >> off) & ((1u << count) - 1u);
+ }}
+ 
++{12}
++
+ fn load_u32_raw(p: ptr<storage, array<u32>>, byte_off: u32) -> u32 {{
+   let word_idx = byte_off >> 2u;
+   let sub = byte_off & 3u;
+@@ -1681,17 +1935,11 @@
+   return (lo >> shift) | (hi << (32u - shift));
+ }}
+ 
+-fn load_u16(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> u32 {{
+-  let word_idx = byte_off >> 2u;
+-  let sub = byte_off & 3u;
+-  let word = p[word_idx];
+-  if (sub <= 2u) {{
+-    return bswap16(extractBits(word, sub * 8u, 16u), le);
+-  }}
+-  let next = p[word_idx + 1u];
+-  let raw = extractBits(word, 24u, 8u) | (extractBits(next, 0u, 8u) << 8u);
+-  return bswap16(raw, le);
+-}}
++// Byte-wise on purpose. On the Adreno 740 (Quest 3) the word-based version of this
++// (16 bits extracted at a runtime offset, two-word path across a word boundary)
++// produced wrong GX_INDEX16 vertex indices at unaligned byte offsets while load_u8
++// was always correct; two byte loads have no alignment cases left to get wrong.
++{13}
+ 
+ fn load_u24(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> u32 {{
+   let raw = load_u32_raw(p, byte_off) & 0x00FFFFFFu;
+@@ -1707,48 +1955,32 @@
+   return bswap32(load_u32_raw(p, byte_off), le);
+ }}
+ 
+-fn load_f32(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> f32 {{
+-  return bitcast<f32>(load_u32(p, byte_off, le));
+-}}
++{11}
+ 
+ fn raw_fetch_u8_1(p: ptr<storage, array<u32>>, byte_off: u32) -> u32 {{
+   return load_u8(p, byte_off);
+ }}
+ 
+ fn raw_fetch_u8_2(p: ptr<storage, array<u32>>, byte_off: u32) -> vec2u {{
+-  let word_idx = byte_off >> 2u;
+-  let sub = byte_off & 3u;
+-  let word = p[word_idx];
+-  if (sub <= 2u) {{
+-    let shift = sub * 8u;
+-    return vec2u(
+-      extractBits(word, shift + 0u, 8u),
+-      extractBits(word, shift + 8u, 8u),
+-    );
+-  }}
+-  let next = p[word_idx + 1u];
+-  return vec2u(
+-    extractBits(word, 24u, 8u),
+-    extractBits(next, 0u, 8u),
+-  );
++  return vec2u(load_u8(p, byte_off), load_u8(p, byte_off + 1u));
+ }}
+ 
+ fn raw_fetch_u8_3(p: ptr<storage, array<u32>>, byte_off: u32) -> vec3u {{
+   let raw = load_u32_raw(p, byte_off);
+   return vec3u(
+-    extractBits(raw, 0u, 8u),
+-    extractBits(raw, 8u, 8u),
+-    extractBits(raw, 16u, 8u),
++    bits(raw, 0u, 8u),
++    bits(raw, 8u, 8u),
++    bits(raw, 16u, 8u),
+   );
+ }}
+ 
+ fn raw_fetch_u8_4(p: ptr<storage, array<u32>>, byte_off: u32) -> vec4u {{
+   let raw = load_u32_raw(p, byte_off);
+   return vec4u(
+-    extractBits(raw, 0u, 8u),
+-    extractBits(raw, 8u, 8u),
+-    extractBits(raw, 16u, 8u),
+-    extractBits(raw, 24u, 8u),
++    bits(raw, 0u, 8u),
++    bits(raw, 8u, 8u),
++    bits(raw, 16u, 8u),
++    bits(raw, 24u, 8u),
+   );
+ }}
+ 
+@@ -1904,8 +2136,7 @@
+   return raw_fetch_f32_4(p, byte_off, le);
+ }}
+ 
+-fn fetch_rgb565(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> vec4f {{
+-  let v = load_u16(p, byte_off, le);
++fn unpack_rgb565(v: u32) -> vec4f {{
+   return vec4f(
+     f32((v >> 11u) & 0x1Fu) / f32(0x1Fu),
+     f32((v >>  5u) & 0x3Fu) / f32(0x3Fu),
+@@ -1914,18 +2145,27 @@
+   );
+ }}
+ 
++fn fetch_rgb565(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> vec4f {{
++  return unpack_rgb565(load_u16(p, byte_off, le));
++}}
++
++fn unpack_rgb8(v: vec3u) -> vec4f {{
++  return vec4f(f32(v.x), f32(v.y), f32(v.z), 255.0) / 255.0;
++}}
++
+ fn fetch_rgb8(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> vec4f {{
+-  let v = raw_fetch_u8_3(p, byte_off);
++  return unpack_rgb8(raw_fetch_u8_3(p, byte_off));
++}}
++
++fn unpack_rgbx8(v: vec4u) -> vec4f {{
+   return vec4f(f32(v.x), f32(v.y), f32(v.z), 255.0) / 255.0;
+ }}
+ 
+ fn fetch_rgbx8(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> vec4f {{
+-  let v = raw_fetch_u8_4(p, byte_off);
+-  return vec4f(f32(v.x), f32(v.y), f32(v.z), 255.0) / 255.0;
++  return unpack_rgbx8(raw_fetch_u8_4(p, byte_off));
+ }}
+ 
+-fn fetch_rgba4(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> vec4f {{
+-  let v = load_u16(p, byte_off, le);
++fn unpack_rgba4(v: u32) -> vec4f {{
+   return vec4f(
+     f32((v >> 12u) & 0x0Fu) / f32(0x0Fu),
+     f32((v >>  8u) & 0x0Fu) / f32(0x0Fu),
+@@ -1934,8 +2174,11 @@
+   );
+ }}
+ 
+-fn fetch_rgba6(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> vec4f {{
+-  let v = load_u24(p, byte_off, le);
++fn fetch_rgba4(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> vec4f {{
++  return unpack_rgba4(load_u16(p, byte_off, le));
++}}
++
++fn unpack_rgba6(v: u32) -> vec4f {{
+   return vec4f(
+     f32((v >> 18u) & 0x3Fu) / f32(0x3Fu),
+     f32((v >> 12u) & 0x3Fu) / f32(0x3Fu),
+@@ -1944,11 +2187,18 @@
+   );
+ }}
+ 
+-fn fetch_rgba8(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> vec4f {{
+-  let v = raw_fetch_u8_4(p, byte_off);
++fn fetch_rgba6(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> vec4f {{
++  return unpack_rgba6(load_u24(p, byte_off, le));
++}}
++
++fn unpack_rgba8(v: vec4u) -> vec4f {{
+   return vec4f(v) / 255.0;
+ }}
+ 
++fn fetch_rgba8(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> vec4f {{
++  return unpack_rgba8(raw_fetch_u8_4(p, byte_off));
++}}
++
+ fn tev_overflow_f32(in: f32) -> f32 {{
+   let byte_space = in * 255.0;
+   return (byte_space - floor(byte_space / 256.0) * 256.0) / 255.0;
+@@ -2023,7 +2273,7 @@
+     render_viewport_size: vec2f,
+     logical_viewport_size: vec2f,
+     pad: vec2u,
+-    array_start: array<u32, 12>,{0}
++    array_start: array<vec4u, 3>,{0}
+ }};
+ @group(0) @binding(0)
+ var<storage, read> vbuf: array<u32>;
+@@ -2051,7 +2301,7 @@
+ )""",
+                                         uniBufAttrs, texBindings, vtxOutAttrs, vtxInAttrs, vtxXfrAttrs, fragmentFn,
+                                         fragmentFnPre, vtxXfrAttrsPre, uniformPre, fragmentReturnType,
+-                                        fragmentReturn);
++                                        fragmentReturn, load_f32_source(), load_u8_source(), load_u16_source());
+   wgpu::ShaderSourceWGSL wgslDescriptor{};
+   wgslDescriptor.code = shaderSource.c_str();
+   const auto label = fmt::format("GX Shader {:x}", hash);
+--- a/aurora-main/lib/gx/shader_info.hpp
++++ b/aurora-main/lib/gx/shader_info.hpp
+@@ -10,6 +10,31 @@
+   std::array<gfx::Range, MaxInterpolatedFrames> interpolated;
+ };
+ 
++// Quest-3 diagnostics: bit mask read once from the AURORA_GX_DEBUG environment variable
++// (decimal). Unset or 0 leaves the renderer untouched. The earlier diagnostic bits 8-512
++// (shader load variants, GPU readback, core vertex shader) were removed after the fault was found.
++constexpr u32 GxDebugIgnorePerVertexPnMtx = 1u; // shader uses ubuf.current_pnmtx, uniform layout unchanged
++constexpr u32 GxDebugCompactMatrixLayout = 2u;  // matrix-index attributes ignored: compact layout, one matrix
++constexpr u32 GxDebugDisableDrawMerge = 4u;     // every GX draw command becomes its own draw call
++constexpr u32 GxDebugDeindex16 = 1024u;         // force CPU de-indexing on (see gx_deindex_enabled)
++constexpr u32 GxDebugComputeRepro = 2048u;      // gfx: compute-shader replay of one GX_INDEX16 position fetch per 180 frames
++u32 gx_debug_flags() noexcept;
++
++// Adreno-740 workaround: every indexed draw is expanded on the CPU into a
++// 4-byte-aligned direct vertex layout (command_processor.cpp, DeindexedDraw), because the Quest-3
++// driver returns wrong bytes from `(word >> shift) & 0xFF` with a variable shift once two such
++// extractions of one word are combined (16-bit indices, and the array loads of 8-bit-indexed draws).
++// Default: on for Android, off elsewhere. AURORA_GX_DEINDEX=0/1 (Config.toml [debug]
++// aurora_deindex) overrides; AURORA_GX_DEBUG bit 1024 forces it on.
++bool gx_deindex_enabled() noexcept;
++
++// Part of the same workaround: a pure-direct draw whose packed
++// stride is not a multiple of 4, or whose attributes are not 4-byte aligned, is copied by the
++// same expansion into the aligned layout (no indices to resolve). Without this, shader.cpp reads
++// such formats with the byte-wise variable-shift loads that the Quest-3 driver gets wrong
++// (confirmed on the THP video panels of the main menu). Follows gx_deindex_enabled().
++bool gx_repack_direct_enabled() noexcept;
++
+ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept;
+ Light prepare_shader_light(Light light) noexcept;
+ UniformRanges build_uniform(const ShaderInfo& info, uint32_t vtxStart, const BindGroupRanges& ranges,
+--- a/aurora-main/lib/gx/shader_info.cpp
++++ b/aurora-main/lib/gx/shader_info.cpp
+@@ -7,6 +7,7 @@
+ #include <chrono>
+ #include <cmath>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #if !defined(_LIBCPP_VERSION)
+ #include <execution>
+@@ -292,6 +293,42 @@
+ }
+ } // namespace
+ 
++bool gx_deindex_enabled() noexcept {
++  static const bool enabled = [] {
++    if ((gx_debug_flags() & GxDebugDeindex16) != 0) {
++      return true;
++    }
++    if (const char* value = std::getenv("AURORA_GX_DEINDEX"); value != nullptr && *value != '\0') {
++      const bool on = std::strtoul(value, nullptr, 10) != 0;
++      Log.info("AURORA_GX_DEINDEX={}: CPU de-indexing {}", value, on ? "on" : "off");
++      return on;
++    }
++#ifdef __ANDROID__
++    return true;
++#else
++    return false;
++#endif
++  }();
++  return enabled;
++}
++
++bool gx_repack_direct_enabled() noexcept { return gx_deindex_enabled(); }
++
++u32 gx_debug_flags() noexcept {
++  static const u32 flags = [] {
++    const char* value = std::getenv("AURORA_GX_DEBUG");
++    if (value == nullptr || *value == '\0') {
++      return 0u;
++    }
++    const auto parsed = static_cast<u32>(std::strtoul(value, nullptr, 10));
++    Log.warn("AURORA_GX_DEBUG={} (1=ignore per-vertex pn matrix index, 2=compact matrix layout, 4=no draw merge, "
++             "1024=force CPU de-indexing, 2048=compute replay of the u16 index fetch)",
++             parsed);
++    return parsed;
++  }();
++  return flags;
++}
++
+ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
+   ZoneScoped;
+ 
+@@ -305,10 +342,14 @@
+     info.lineMode = config.lineMode;
+   }
+ 
++  const bool debugCompactLayout = (gx_debug_flags() & GxDebugCompactMatrixLayout) != 0;
+   for (int attr = 0; attr < config.attrs.size(); attr++) {
+     const auto attrType = config.attrs[attr].attrType;
+     if ((attr == GX_VA_PNMTXIDX || (attr >= GX_VA_TEX0MTXIDX && attr <= GX_VA_TEX7MTXIDX)) && attrType == GX_DIRECT) {
+-      info.indexAttr.set(attr);
++      // Diagnostic bit 2: the matrix-index bytes stay in the vertex (the stride is unchanged) but no longer select a matrix.
++      if (!debugCompactLayout) {
++        info.indexAttr.set(attr);
++      }
+     } else if (attrType == GX_INDEX8 || attrType == GX_INDEX16) {
+       info.indexAttr.set(attr);
+     }
+@@ -423,7 +464,7 @@
+     auto& layout = info.matrixLayout;
+     layout.postexRemap.fill(UniformMatrixLayout::kAbsent);
+ 
+-    const bool dynamicPnMtx = config.attrs[GX_VA_PNMTXIDX].attrType != GX_NONE;
++    const bool dynamicPnMtx = config.attrs[GX_VA_PNMTXIDX].attrType != GX_NONE && !debugCompactLayout;
+     bool dynamicTexMtx = false;
+     std::bitset<MaxPostexMtx> literalSlots;
+     for (size_t i = 0; i < info.sampledTexCoords.size(); ++i) {
+--- a/aurora-main/lib/gx/command_processor.cpp
++++ b/aurora-main/lib/gx/command_processor.cpp
+@@ -2080,6 +2080,257 @@
+   return state;
+ }
+ 
++// Adreno-740 workaround (gx_deindex_enabled): the Quest-3 driver returns
++// wrong bytes from `(word >> shift) & 0xFF` with a variable shift once two such extractions of
++// one word are combined, which breaks every indexed vertex fetch (16-bit indices in the vertex
++// stream, and the array element loads of 8-bit-indexed draws). Every indexed draw is therefore
++// expanded on the CPU: each indexed attribute is replaced by the array element it refers to,
++// laid out 4-byte aligned (deindexed_attr_offset), so the GPU sees a direct vertex format that
++// shader.cpp reads word-wise with constant shifts. Arrays and vertex buffer are both big-endian,
++// so element bytes are copied unchanged; little-endian arrays leave the draw indexed.
++struct DeindexPlan {
++  struct Attr {
++    u8 srcOffset = 0;  // byte offset inside the FIFO vertex
++    u8 dstOffset = 0;  // byte offset inside the expanded vertex
++    u8 bytes = 0;      // bytes copied per direct attribute, or per index for indexed ones
++    u8 indexSize = 0;  // 0 = direct copy, 1 or 2 = index width in bytes
++    u8 indexCount = 1; // 3 for NBT3 normals (three indices per vertex), otherwise 1
++    u8 arrayStride = 0;
++    const u8* array = nullptr;
++    u32 arraySize = 0;
++  };
++  std::array<Attr, MaxVtxAttr> attrs{};
++  u32 count = 0;
++  u32 srcStride = 0;
++  u32 dstStride = 0;
++};
++
++static bool build_deindex_plan(GXVtxFmt fmt, DeindexPlan& plan) noexcept {
++  bool hasIndexed = false;
++  for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
++    if (g_gxState.vtxDesc[i] == GX_INDEX8 || g_gxState.vtxDesc[i] == GX_INDEX16) {
++      hasIndexed = true;
++      break;
++    }
++  }
++  // Pure-direct draws are repacked too (gx_repack_direct_enabled), but only when their packed
++  // layout differs from the aligned one (decided below, once the offsets are known).
++  if (!hasIndexed && !gx_repack_direct_enabled()) {
++    return false;
++  }
++  const auto& vtxFmt = g_gxState.vtxFmts[fmt];
++  plan.count = 0;
++  u32 src = 0;
++  u32 dst = 0;
++  for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
++    const auto desc = g_gxState.vtxDesc[i];
++    if (desc == GX_NONE) {
++      continue;
++    }
++    const auto attr = static_cast<GXAttr>(i);
++    const auto& attrFmt = vtxFmt.attrs[i];
++    const u32 elemBytes = comp_type_size(attr, attrFmt.type) * comp_cnt_count(attr, attrFmt.cnt);
++    DeindexPlan::Attr a{};
++    a.srcOffset = static_cast<u8>(src);
++    // Same rule as populate_pipeline_config under g_gxState.deindexedLayout.
++    dst = deindexed_attr_offset(dst, attr);
++    a.dstOffset = static_cast<u8>(dst);
++    if (desc == GX_DIRECT) {
++      a.bytes = static_cast<u8>(elemBytes);
++      src += elemBytes;
++    } else {
++      const auto& array = g_gxState.arrays[i];
++      if (array.data == nullptr || array.le) UNLIKELY {
++        // Deterministic per generation (array base/le bump it), so the memo stays coherent.
++        static u32 bailLogs = 0;
++        if (bailLogs++ < 8) {
++          Log.warn("deindex: attr {} array data={} le={}, draw left indexed", i, array.data != nullptr, array.le);
++        }
++        return false;
++      }
++      a.indexSize = desc == GX_INDEX16 ? 2 : 1;
++      a.indexCount = (attr == GX_VA_NRM && attrFmt.cnt == GX_NRM_NBT3) ? 3 : 1;
++      a.bytes = static_cast<u8>(elemBytes / a.indexCount);
++      a.arrayStride = array.stride;
++      a.array = static_cast<const u8*>(array.data);
++      a.arraySize = array.size;
++      src += static_cast<u32>(a.indexSize) * a.indexCount;
++    }
++    dst += elemBytes;
++    plan.attrs[plan.count++] = a;
++  }
++  plan.srcStride = src;
++  plan.dstStride = deindexed_stride(dst);
++  if (!hasIndexed) {
++    // Already word-aligned as the game laid it out: nothing to gain from a copy. Like the
++    // decision above this depends only on VCD and VAT, so the resolved-pipeline memo holds.
++    bool aligned = plan.srcStride == plan.dstStride;
++    for (u32 n = 0; n < plan.count && aligned; ++n) {
++      aligned = plan.attrs[n].srcOffset == plan.attrs[n].dstOffset;
++    }
++    if (aligned) {
++      return false;
++    }
++  }
++  return true;
++}
++
++// Returns the number of indices that pointed beyond their array (written as zeros).
++static u32 deindex_vertices(const DeindexPlan& plan, const u8* src, u16 vtxCount, u8* dst) noexcept {
++  u32 outOfRange = 0;
++  for (u32 v = 0; v < vtxCount; ++v) {
++    const u8* sv = src + static_cast<size_t>(v) * plan.srcStride;
++    u8* dv = dst + static_cast<size_t>(v) * plan.dstStride;
++    std::memset(dv, 0, plan.dstStride); // alignment padding between attributes
++    for (u32 n = 0; n < plan.count; ++n) {
++      const auto& a = plan.attrs[n];
++      if (a.indexSize == 0) {
++        std::memcpy(dv + a.dstOffset, sv + a.srcOffset, a.bytes);
++        continue;
++      }
++      for (u32 k = 0; k < a.indexCount; ++k) {
++        const u8* p = sv + a.srcOffset + k * a.indexSize;
++        const u32 idx = a.indexSize == 2 ? (static_cast<u32>(p[0]) << 8) | p[1] : p[0];
++        const u32 off = idx * a.arrayStride;
++        u8* out = dv + a.dstOffset + k * a.bytes;
++        if (off + a.bytes <= a.arraySize) LIKELY {
++          std::memcpy(out, a.array + off, a.bytes);
++        } else {
++          // Same result as the GPU's robust storage access: out-of-range reads yield zero.
++          std::memset(out, 0, a.bytes);
++          ++outOfRange;
++        }
++      }
++    }
++  }
++  return outOfRange;
++}
++
++// One log line per distinct de-indexed vertex format (descriptor, VAT and strides), so the log
++// lists which models go through the expansion; out-of-range indices are reported once per format.
++static void log_deindex_plan(GXVtxFmt fmt, const DeindexPlan& plan, u32 outOfRange) noexcept {
++  static std::array<u64, 256> seen{};
++  static std::array<bool, 256> seenOutOfRange{};
++  static u32 seenCount = 0;
++  const auto& vtxFmt = g_gxState.vtxFmts[fmt];
++  u64 key = static_cast<u64>(fmt) | (static_cast<u64>(plan.srcStride) << 8) | (static_cast<u64>(plan.dstStride) << 16);
++  std::string desc;
++  for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
++    const auto attrType = g_gxState.vtxDesc[i];
++    if (attrType == GX_NONE) {
++      continue;
++    }
++    const auto& attr = vtxFmt.attrs[i];
++    key = key * 1099511628211ull ^ (static_cast<u64>(i) | (static_cast<u64>(attrType) << 8) |
++                                    (static_cast<u64>(attr.type) << 16) | (static_cast<u64>(attr.cnt) << 24) |
++                                    (static_cast<u64>(attr.frac) << 32));
++    const char* how = attrType == GX_DIRECT ? "D" : attrType == GX_INDEX8 ? "I8" : "I16";
++    if (i >= GX_VA_POS) {
++      desc += fmt::format(" {}:{}(t{}c{}f{})", i, how, static_cast<int>(attr.type), static_cast<int>(attr.cnt),
++                          static_cast<int>(attr.frac));
++    } else {
++      desc += fmt::format(" {}:{}", i, how);
++    }
++  }
++  for (u32 k = 0; k < seenCount; ++k) {
++    if (seen[k] == key) {
++      if (outOfRange != 0 && !seenOutOfRange[k]) {
++        seenOutOfRange[k] = true;
++        Log.warn("deindex: {} indices beyond their array in format vat={}{}", outOfRange, static_cast<int>(fmt), desc);
++      }
++      return;
++    }
++  }
++  if (seenCount >= seen.size()) {
++    return;
++  }
++  seen[seenCount] = key;
++  seenOutOfRange[seenCount] = outOfRange != 0;
++  ++seenCount;
++  Log.info("deindex: format vat={} stride {} -> {} (t0=u8 1=s8 2=u16 3=s16 4=f32):{}{}", static_cast<int>(fmt),
++           plan.srcStride, plan.dstStride, desc, outOfRange != 0 ? fmt::format(" [{} indices beyond array]", outOfRange) : "");
++}
++
++// Vertex descriptor override for a de-indexed draw: populate_pipeline_config, the storage
++// range loop in handle_draw_unmerged and the geometry signature all read g_gxState.vtxDesc,
++// so for the duration of the draw the indexed attributes are declared GX_DIRECT and restored
++// afterwards. The resolved-pipeline memo stays valid: the override is a pure function of the
++// state that stamps pipelineStateGeneration (VCD, VAT, array bases), so every draw of one
++// generation sees the same descriptor.
++struct DeindexedDraw {
++  const u8* vertices = nullptr;
++  u32 vtxSize = 0;
++  bool active = false;
++  std::array<GXAttrType, MaxVtxAttr> savedDesc{};
++
++  DeindexedDraw(GXVtxFmt fmt, const u8* srcVertices, u16 vtxCount, u32 srcVtxSize) noexcept
++      : vertices(srcVertices), vtxSize(srcVtxSize) {
++    if (!gx_deindex_enabled()) {
++      return;
++    }
++    static DeindexPlan plan{};
++    static std::vector<u8> buffer;
++    if (!build_deindex_plan(fmt, plan)) {
++      return;
++    }
++    // A draw that the plan covers but that is left indexed anyway (below) must not share the
++    // resolved-pipeline memo or a merged draw with de-indexed draws of the same generation:
++    // bump the generation on the way out, and again when de-indexing resumes.
++    static u32 fallbackGeneration = 0;
++    const auto leaveIndexed = [] {
++      mark_pipeline_state_dirty();
++      fallbackGeneration = g_gxState.pipelineStateGeneration;
++    };
++    if (plan.srcStride != srcVtxSize) UNLIKELY {
++      static u32 mismatchLogs = 0;
++      if (mismatchLogs++ < 8) {
++        Log.warn("deindex: stride mismatch fmt={} plan={} draw={}, draw left indexed", static_cast<u32>(fmt),
++                 plan.srcStride, srcVtxSize);
++      }
++      leaveIndexed();
++      return;
++    }
++    const size_t bytes = static_cast<size_t>(vtxCount) * plan.dstStride;
++    // The vertex staging partition is fixed per frame and aborts on overflow; a draw that
++    // would not fit stays indexed (wrong on the Quest, but no crash).
++    if (bytes > gfx::verts_remaining()) UNLIKELY {
++      static u32 capacityLogs = 0;
++      if (capacityLogs++ < 8) {
++        Log.warn("deindex: {} bytes exceed the free vertex staging ({}), draw left indexed", bytes,
++                 gfx::verts_remaining());
++      }
++      leaveIndexed();
++      return;
++    }
++    if (g_gxState.pipelineStateGeneration == fallbackGeneration) UNLIKELY {
++      mark_pipeline_state_dirty();
++    }
++    if (buffer.size() < bytes) {
++      buffer.resize(bytes);
++    }
++    const u32 outOfRange = deindex_vertices(plan, srcVertices, vtxCount, buffer.data());
++    log_deindex_plan(fmt, plan, outOfRange);
++    savedDesc = g_gxState.vtxDesc;
++    for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
++      if (g_gxState.vtxDesc[i] == GX_INDEX8 || g_gxState.vtxDesc[i] == GX_INDEX16) {
++        g_gxState.vtxDesc[i] = GX_DIRECT;
++      }
++    }
++    g_gxState.deindexedLayout = true;
++    vertices = buffer.data();
++    vtxSize = plan.dstStride;
++    active = true;
++  }
++  ~DeindexedDraw() {
++    if (active) {
++      g_gxState.vtxDesc = savedDesc;
++      g_gxState.deindexedLayout = false;
++    }
++  }
++  DeindexedDraw(const DeindexedDraw&) = delete;
++  DeindexedDraw& operator=(const DeindexedDraw&) = delete;
++};
++
+ bool submit_raw_draw(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, uint16_t vtxCount,
+                      uint32_t vertexBytes) {
+   ZoneScoped;
+@@ -2114,18 +2365,93 @@
+ 
+   // This entry point bypasses process(), so it owns the renderer lock itself.
+   std::lock_guard gpuLock(aurora::renderer_gpu_mutex());
+-  const gfx::Range vertRange = gfx::push_verts(vertices, vertexBytes);
++  // Same de-indexing as handle_draw (gx_deindex_enabled); both entry points must agree,
++  // since they share the resolved-pipeline memo.
++  const DeindexedDraw deindexed(fmt, vertices, vtxCount, vtxSize);
++  const uint8_t* drawVertices = deindexed.vertices;
++  const u32 drawVtxSize = deindexed.vtxSize;
++  gfx::align_verts(4); // raw draws never merge
++  const gfx::Range vertRange = gfx::push_verts(drawVertices, static_cast<u32>(vtxCount) * drawVtxSize);
+   const bool interpolationIdentityActive = frame_interpolation_identity_needed();
+   const PnMtxUsage matrixUsage = interpolationIdentityActive
+-                                     ? pn_mtx_usage(vertices, vtxCount, vtxSize)
++                                     ? pn_mtx_usage(drawVertices, vtxCount, drawVtxSize)
+                                      : PnMtxUsage{};
+   handle_draw_unmerged(prim, fmt, vtxCount, vertRange,
+                        matrixUsage.mask, matrixUsage.topologySignature,
+-                       interpolationIdentityActive ? draw_geometry_signature(fmt, vertices, vtxCount, vtxSize) : 0,
++                       interpolationIdentityActive ? draw_geometry_signature(fmt, drawVertices, vtxCount, drawVtxSize) : 0,
+                        interpolationIdentityActive);
+   return true;
+ }
+ 
++// Quest-3 diagnostics (AURORA_GX_DEBUG bit 2048): hands one unmerged draw with a 16-bit-indexed
++// f32 position per 180 frames to the compute replay in gfx (DebugComputeReproRequest), together
++// with the index and position words the CPU reads from the same FIFO bytes and array.
++static void debug_record_compute_repro(GXVtxFmt fmt, const u8* vertices, u16 vtxCount, u32 vtxSize,
++                                       gfx::Range vertRange) noexcept {
++  if ((gx_debug_flags() & GxDebugComputeRepro) == 0 || !gfx::debug_compute_repro_wanted()) {
++    return;
++  }
++  if (g_gxState.vtxDesc[GX_VA_POS] != GX_INDEX16 || vtxCount == 0) {
++    return;
++  }
++  const auto& attrFmt = g_gxState.vtxFmts[fmt].attrs[GX_VA_POS];
++  if (attrFmt.type != GX_F32 || attrFmt.cnt != GX_POS_XYZ) {
++    return;
++  }
++  const auto& array = g_gxState.arrays[GX_VA_POS];
++  if (array.cachedRange.size == 0 || array.data == nullptr || array.le) {
++    return;
++  }
++  gfx::DebugComputeReproRequest req;
++  req.vtxStart = vertRange.offset;
++  req.vtxStride = vtxSize;
++  req.posOffset = matrix_index_prefix_size(fmt);
++  req.arrayStart = array.cachedRange.offset;
++  req.arrayStride = array.stride;
++  req.count = vtxCount;
++  req.expected.resize(static_cast<size_t>(vtxCount) * 4);
++  req.expectedWords.resize(static_cast<size_t>(vtxCount) * 4);
++  const u8* bytes = static_cast<const u8*>(array.data);
++  // Byte at an absolute vertex-buffer offset, if it lies inside this draw's bytes.
++  const size_t drawBytes = static_cast<size_t>(vtxCount) * vtxSize;
++  const auto vbufByte = [&](u32 absolute, u32& out) -> bool {
++    if (absolute < vertRange.offset || absolute - vertRange.offset >= drawBytes) {
++      return false;
++    }
++    out = vertices[absolute - vertRange.offset];
++    return true;
++  };
++  const auto vbufWord = [&](u32 absoluteAligned) -> u32 {
++    u32 w = 0;
++    for (u32 k = 0; k < 4; ++k) {
++      u32 b = 0;
++      if (!vbufByte(absoluteAligned + k, b)) {
++        return UINT32_MAX;
++      }
++      w |= b << (8 * k);
++    }
++    return w;
++  };
++  for (u32 v = 0; v < vtxCount; ++v) {
++    const u32 absolute = vertRange.offset + v * vtxSize + req.posOffset;
++    u32* ew = req.expectedWords.data() + static_cast<size_t>(v) * 4;
++    ew[0] = vbufWord(absolute & ~3u);
++    ew[1] = vbufWord((absolute & ~3u) + 4);
++    ew[2] = ew[3] = UINT32_MAX;
++    vbufByte(absolute, ew[2]);
++    vbufByte(absolute + 1, ew[3]);
++    const u8* p = vertices + static_cast<size_t>(v) * vtxSize + req.posOffset;
++    const u32 idx = (static_cast<u32>(p[0]) << 8) | p[1];
++    const u32 off = idx * array.stride;
++    u32* e = req.expected.data() + static_cast<size_t>(v) * 4;
++    e[0] = idx;
++    for (u32 c = 0; c < 3; ++c) {
++      e[1 + c] = off + 4 * c + 4 <= array.size ? read_u32(bytes + off + 4 * c, true) : 0u;
++    }
++  }
++  gfx::debug_compute_repro_record(std::move(req));
++}
++
+ static bool handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndian) {
+   ZoneScoped;
+   GXVtxFmt fmt = static_cast<GXVtxFmt>(cmd & CP_VAT_MASK);
+@@ -2152,16 +2478,29 @@
+ 
+ 
+   // Push raw vertex data to buffer
+-  const uint8_t* vertices = data + pos;
+-  gfx::Range vertRange = gfx::push_verts(vertices, totalVtxBytes);
++  const uint8_t* fifoVertices = data + pos;
+   pos += totalVtxBytes;
++  // Lives until the draw is recorded: it may swap the vertex data for a de-indexed copy and
++  // overrides g_gxState.vtxDesc for that time (gx_deindex_enabled).
++  const u32 fifoVtxSize = vtxSize;
++  const DeindexedDraw deindexed(fmt, fifoVertices, vtxCount, vtxSize);
++  const uint8_t* vertices = deindexed.vertices;
++  vtxSize = deindexed.vtxSize;
++  // Merge decision before the push: a merged draw must stay contiguous with the previous one,
++  // every other draw starts 4-byte aligned (word-wise direct loads in the shader).
++  // (AURORA_GX_DEBUG bit 4 disables merging so every GX draw keeps its own index template.)
++  auto* lastDraw = gfx::get_last_draw_command<DrawData>();
++  const bool mergeable = !g_gxState.stateDirty && (gx_debug_flags() & GxDebugDisableDrawMerge) == 0 &&
++                         lastDraw != nullptr && prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS &&
++                         lastDraw->instanceCount == 1;
++  if (!mergeable) {
++    gfx::align_verts(4);
++  }
++  gfx::Range vertRange = gfx::push_verts(vertices, static_cast<u32>(vtxCount) * vtxSize);
+ 
+   // Try to merge with previous draw call
+-  if (!g_gxState.stateDirty) LIKELY {
+-    auto* lastDraw = gfx::get_last_draw_command<DrawData>();
+-    // Only if the previous draw call was a single instance draw (no lines/points handling)
+-    if (lastDraw != nullptr && prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS &&
+-        lastDraw->instanceCount == 1) LIKELY {
++  if (mergeable) LIKELY {
++    {
+       const auto& indexTemplate = cached_index_template(prim, vtxCount);
+       const auto indices = offset_index_template(indexTemplate, lastDraw->vtxCount);
+       const u32 numIndices = indexTemplate.indexCount;
+@@ -2193,6 +2532,11 @@
+                        matrixUsage.mask, matrixUsage.topologySignature,
+                        interpolationIdentityActive ? draw_geometry_signature(fmt, vertices, vtxCount, vtxSize) : 0,
+                        interpolationIdentityActive);
++  // Only meaningful for a draw that reached the GPU indexed (bit 2048 with aurora_deindex = false): the
++  // array's cachedRange was just pushed by handle_draw_unmerged.
++  if (!deindexed.active) {
++    debug_record_compute_repro(fmt, fifoVertices, vtxCount, fifoVtxSize, vertRange);
++  }
+   return true;
+ }
+ 
+--- a/aurora-main/lib/gx/gx.hpp
++++ b/aurora-main/lib/gx/gx.hpp
+@@ -361,6 +361,10 @@
+   std::array<TexCoordScale, MaxTexCoord> texCoordScales;
+   u16 lastVtxSize = 0;
+   GXVtxFmt lastVtxFmt = GX_MAX_VTXFMT;
++  // Quest-3 workaround: true while a de-indexed draw is being recorded (command_processor.cpp,
++  // DeindexedDraw). populate_pipeline_config then lays the direct attributes out 4-byte aligned
++  // (deindexed_attr_offset) instead of packed.
++  bool deindexedLayout = false;
+   std::array<GXAttrType, MaxVtxAttr> vtxDesc;
+   std::array<GXAttrType, MaxVtxAttr> sourceVtxDesc;
+   std::array<VtxFmt, MaxVtxFmt> vtxFmts;
+@@ -756,6 +760,13 @@
+   std::array<gfx::Range, MaxIndexAttr> vaRanges{};
+ };
+ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept;
++// Byte offset of a direct attribute in a de-indexed vertex: matrix indices stay packed at the
++// front, every other attribute starts 4-byte aligned; the stride is rounded up to 4 as well
++// (deindexed_stride). Shared by the CPU expansion and populate_pipeline_config.
++inline u32 deindexed_attr_offset(u32 offset, GXAttr attr) noexcept {
++  return attr >= GX_VA_POS ? (offset + 3u) & ~3u : offset;
++}
++inline u32 deindexed_stride(u32 packedStride) noexcept { return (packedStride + 3u) & ~3u; }
+ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu::VertexBufferLayout> vtxBuffers,
+                                     wgpu::ShaderModule shader, const char* label) noexcept;
+ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept;
+--- a/aurora-main/lib/gx/gx.cpp
++++ b/aurora-main/lib/gx/gx.cpp
+@@ -1765,6 +1765,9 @@
+     }
+     const auto& attrFmt = vtxFmt.attrs[i];
+     const auto cnt = comp_cnt_count(attr, attrFmt.cnt);
++    if (g_gxState.deindexedLayout) {
++      vtxOffset = static_cast<u8>(deindexed_attr_offset(vtxOffset, attr));
++    }
+     mapping = AttrConfig{
+         .attrType = static_cast<u8>(type),
+         .cnt = cnt,
+@@ -1794,6 +1797,9 @@
+       Log.fatal("populate_pipeline_config: Invalid vertex type {}", type);
+     }
+   }
++  if (g_gxState.deindexedLayout) {
++    vtxOffset = static_cast<u8>(deindexed_stride(vtxOffset));
++  }
+   config.shaderConfig.vtxStride = vtxOffset;
+   if (primitive == GX_LINES) {
+     config.shaderConfig.lineMode = 1;
+--- a/aurora-main/lib/gfx/common.hpp
++++ b/aurora-main/lib/gfx/common.hpp
+@@ -10,6 +10,7 @@
+ #include <memory>
+ #include <type_traits>
+ #include <utility>
++#include <vector>
+ 
+ #include <aurora/gfx.h>
+ #include <aurora/math.hpp>
+@@ -226,7 +227,9 @@
+ namespace aurora::gfx {
+ inline constexpr bool UseTextureBuffer = false;
+ inline constexpr uint64_t UniformBufferSize = 25165824;  // 24mb
+-inline constexpr uint64_t VertexBufferSize = 3145728;    // 3mb
++// 16 MiB (was 3 MiB): the Quest-3 de-indexing workaround (command_processor.cpp, DeindexedDraw)
++// expands 16-bit-indexed vertices 2-5x, and ByteBuffer aborts when this partition overflows.
++inline constexpr uint64_t VertexBufferSize = 16777216;   // 16mb
+ inline constexpr uint64_t IndexBufferSize = 2097152;     // 2mb
+ inline constexpr uint64_t StorageBufferSize = 8388608;   // 8mb
+ inline constexpr uint64_t TextureUploadSize = 25165824;  // 24mb
+@@ -283,6 +286,28 @@
+ void abort_frame() noexcept;
+ void end_frame(const wgpu::CommandEncoder& cmd);
+ void end_batch(const wgpu::CommandEncoder& cmd);
++// Quest-3 diagnostics: after the batch's command buffer has been submitted, completes a pending
++// compute replay (bit 2048, below). No-op otherwise.
++void debug_complete_readback();
++// Quest-3 diagnostics (AURORA_GX_DEBUG bit 2048): compute-shader replay of the vertex shader's
++// GX_INDEX16 -> f32x3 position fetch (load_u16 -> array_start + idx * stride -> load_f32 x3) over
++// the real vertex and storage buffers of one draw, results read back and compared with the CPU.
++// Decides whether the fault is specific to the vertex stage or reproduces in compute.
++struct DebugComputeReproRequest {
++  uint32_t vtxStart = 0;    // byte offset of the draw's vertices in the vertex buffer
++  uint32_t vtxStride = 0;   // FIFO vertex size in bytes
++  uint32_t posOffset = 0;   // byte offset of the 16-bit position index inside a vertex
++  uint32_t arrayStart = 0;  // byte offset of the position array in the storage buffer
++  uint32_t arrayStride = 0;
++  uint32_t count = 0;       // vertices to replay
++  std::vector<uint32_t> expected; // count * 4 words: index, x, y, z bit patterns, computed on the CPU
++  // count * 4 words: the word holding the index, the next word, index byte 0, index byte 1, as the
++  // CPU sees them in the same vertex bytes (UINT32_MAX = outside the draw's bytes, not compared)
++  std::vector<uint32_t> expectedWords;
++};
++// True while a request may be recorded for the current batch (rate limited, one draw per batch).
++bool debug_compute_repro_wanted() noexcept;
++void debug_compute_repro_record(DebugComputeReproRequest&& request);
+ uint32_t current_frame() noexcept;
+ 
+ // One frame's recorded render passes, detached from the guest-visible
+@@ -344,6 +369,12 @@
+ void queue_palette_conv(tex_palette_conv::ConvRequest req);
+ 
+ Range push_verts(const uint8_t* data, size_t length);
++// Bytes still free in the vertex staging partition of the current frame (it cannot grow).
++size_t verts_remaining() noexcept;
++// Pads the vertex staging so the next push_verts starts at a multiple of `alignment`. Called for
++// every draw that does not merge into the previous one, so a draw's vtx_start is 4-byte aligned
++// and the shader may read direct attributes word-wise (shader.cpp, aligned_direct).
++void align_verts(size_t alignment);
+ template <typename T>
+ static Range push_verts(ArrayRef<T> data) {
+   return push_verts(reinterpret_cast<const uint8_t*>(data.data()), data.size() * sizeof(T));
+--- a/aurora-main/lib/gfx/common.cpp
++++ b/aurora-main/lib/gfx/common.cpp
+@@ -16,6 +16,7 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <bit>
+ #include <chrono>
+ #include <cmath>
+ #include <cstdlib>
+@@ -1017,6 +1018,13 @@
+     }
+   }
+   g_recordingSnapshotSlot = currentStagingBuffer;
++  // A draw processed while no frame was prepared (the staging map was aborted and the frame dropped)
++  // records a storage offset into a private fallback buffer; without this reset the next real frame
++  // would reuse that offset for the same guest array and read bytes never uploaded. end_batch_impl
++  // clears these too, but it does not run for a dropped frame.
++  for (auto& array : gx::g_gxState.arrays) {
++    array.cachedRange = {};
++  }
+   size_t bufferOffset = 0;
+   const auto& stagingBuf = g_stagingBuffers[currentStagingBuffer];
+   const auto mapBuffer = [&](ByteBuffer& buf, uint64_t size) {
+@@ -1099,6 +1107,453 @@
+   end_pipeline_frame();
+ }
+ 
++namespace {
++void complete_compute_repro();
++} // namespace
++
++// Runs after the batch's command buffer was submitted; no-op unless a compute replay is pending.
++void debug_complete_readback() { complete_compute_repro(); }
++
++// Quest-3 diagnostics (AURORA_GX_DEBUG bit 2048): compute replay of the GX_INDEX16 position fetch.
++// The WGSL below is a verbatim copy of the vertex shader's default load chain (shader.cpp) with
++// the same constant folding: vertex stride, index offset and array stride are literals, the
++// buffer bases come from a uniform, exactly as in the generated vertex shader.
++namespace {
++struct DebugComputeRepro {
++  static constexpr uint32_t kMaxVertices = 4096;
++  // Region A (chain kernel): 4 words per vertex; region B (diagnostic kernel): 8 words per vertex.
++  static constexpr uint64_t kOutBytes = static_cast<uint64_t>(kMaxVertices) * (16 + 32);
++  struct Pipeline {
++    uint32_t kind = 0;
++    uint32_t vtxStride = 0;
++    uint32_t posOffset = 0;
++    uint32_t arrayStride = 0;
++    wgpu::ComputePipeline pipeline;
++  };
++  wgpu::BindGroupLayout layout;
++  std::vector<Pipeline> pipelines;
++  wgpu::Buffer params;
++  wgpu::Buffer output;
++  wgpu::Buffer readback;
++  std::optional<DebugComputeReproRequest> request; // recorded by the producer, consumed by end_batch
++  DebugComputeReproRequest inFlight;
++  bool pending = false;
++  uint32_t frame = 0;
++  uint32_t lastRecordedFrame = UINT32_MAX;
++};
++DebugComputeRepro g_debugCompute;
++
++std::string compute_repro_source(uint32_t vtxStride, uint32_t posOffset, uint32_t arrayStride) {
++  return fmt::format(R"""(
++fn bswap32(v: u32, le: bool) -> u32 {{
++  if (le) {{
++    return v;
++  }}
++  return ((v & 0x000000FFu) << 24u) |
++         ((v & 0x0000FF00u) << 8u) |
++         ((v & 0x00FF0000u) >> 8u) |
++         ((v & 0xFF000000u) >> 24u);
++}}
++
++fn load_u32_raw(p: ptr<storage, array<u32>>, byte_off: u32) -> u32 {{
++  let word_idx = byte_off >> 2u;
++  let sub = byte_off & 3u;
++  let lo = p[word_idx];
++  if (sub == 0u) {{
++    return lo;
++  }}
++  let hi = p[word_idx + 1u];
++  let shift = sub * 8u;
++  return (lo >> shift) | (hi << (32u - shift));
++}}
++
++fn load_u8(p: ptr<storage, array<u32>>, byte_off: u32) -> u32 {{
++  let word = p[byte_off / 4u];
++  let shift = (byte_off & 3u) * 8u;
++  return (word >> shift) & 0xFFu;
++}}
++
++fn load_u16(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> u32 {{
++  let b0 = load_u8(p, byte_off);
++  let b1 = load_u8(p, byte_off + 1u);
++  if (le) {{
++    return b0 | (b1 << 8u);
++  }}
++  return (b0 << 8u) | b1;
++}}
++
++fn load_u32(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> u32 {{
++  return bswap32(load_u32_raw(p, byte_off), le);
++}}
++
++fn load_f32(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> f32 {{
++  return bitcast<f32>(load_u32(p, byte_off, le));
++}}
++
++fn raw_fetch_u16_1(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> u32 {{
++  return load_u16(p, byte_off, le);
++}}
++
++fn raw_fetch_f32_3(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> vec3f {{
++  return vec3f(
++    load_f32(p, byte_off + 0u, le),
++    load_f32(p, byte_off + 4u, le),
++    load_f32(p, byte_off + 8u, le),
++  );
++}}
++
++struct Params {{
++  vtx_start: u32,
++  array_start: u32,
++  count: u32,
++  pad: u32,
++}};
++
++@group(0) @binding(0)
++var<storage, read> vbuf: array<u32>;
++@group(0) @binding(1)
++var<storage, read> abuf: array<u32>;
++@group(0) @binding(2)
++var<storage, read_write> out_buf: array<u32>;
++@group(0) @binding(3)
++var<uniform> params: Params;
++
++@compute @workgroup_size(64)
++fn cs_main(@builtin(global_invocation_id) id: vec3u) {{
++  let vidx = id.x;
++  if (vidx >= params.count) {{
++    return;
++  }}
++  // Same expression shape as attr_load for GX_VA_POS with GX_INDEX16 (vertex shader).
++  let idx = raw_fetch_u16_1(&vbuf, params.vtx_start + vidx * {0}u + {1}u, false);
++  let pos = raw_fetch_f32_3(&abuf, params.array_start + idx * {2}u, false);
++  out_buf[vidx * 4u + 0u] = idx;
++  out_buf[vidx * 4u + 1u] = bitcast<u32>(pos.x);
++  out_buf[vidx * 4u + 2u] = bitcast<u32>(pos.y);
++  out_buf[vidx * 4u + 3u] = bitcast<u32>(pos.z);
++}}
++)""",
++                     vtxStride, posOffset, arrayStride);
++}
++
++
++// Diagnostic kernel: the same index bytes read in several formulations, so one run tells which
++// of them the driver gets right. w0/w1 = raw words, b0/b1 = load_u8 (the vertex shader's way),
++// x0 = extractBits, x1 = select over constant shifts, x2 = switch over constant shifts,
++// x3 = inline variable shift, x4 = byte 0 via bswap of the whole word.
++std::string compute_diag_source(uint32_t vtxStride, uint32_t posOffset) {
++  return fmt::format(R"""(
++fn load_u8(p: ptr<storage, array<u32>>, byte_off: u32) -> u32 {{
++  let word = p[byte_off / 4u];
++  let shift = (byte_off & 3u) * 8u;
++  return (word >> shift) & 0xFFu;
++}}
++
++struct Params {{
++  vtx_start: u32,
++  array_start: u32,
++  count: u32,
++  pad: u32,
++}};
++
++@group(0) @binding(0)
++var<storage, read> vbuf: array<u32>;
++@group(0) @binding(1)
++var<storage, read> abuf: array<u32>;
++@group(0) @binding(2)
++var<storage, read_write> out_buf: array<u32>;
++@group(0) @binding(3)
++var<uniform> params: Params;
++
++@compute @workgroup_size(64)
++fn cs_main(@builtin(global_invocation_id) id: vec3u) {{
++  let vidx = id.x;
++  if (vidx >= params.count) {{
++    return;
++  }}
++  let off = params.vtx_start + vidx * {0}u + {1}u;
++  let sub = off & 3u;
++  let w0 = vbuf[off >> 2u];
++  let w1 = vbuf[(off >> 2u) + 1u];
++  let b0 = load_u8(&vbuf, off);
++  let b1 = load_u8(&vbuf, off + 1u);
++  let x0 = extractBits(w0, sub * 8u, 8u);
++  let x1 = select(select(w0 & 0xFFu, (w0 >> 8u) & 0xFFu, sub == 1u), select((w0 >> 16u) & 0xFFu, w0 >> 24u, sub == 3u), sub >= 2u);
++  var x2: u32;
++  switch (sub) {{
++    case 0u: {{ x2 = w0 & 0xFFu; }}
++    case 1u: {{ x2 = (w0 >> 8u) & 0xFFu; }}
++    case 2u: {{ x2 = (w0 >> 16u) & 0xFFu; }}
++    default: {{ x2 = w0 >> 24u; }}
++  }}
++  let x3 = (w0 >> (sub * 8u)) & 0xFFu;
++  let base = {2}u + vidx * 8u;
++  out_buf[base + 0u] = w0;
++  out_buf[base + 1u] = w1;
++  out_buf[base + 2u] = b0;
++  out_buf[base + 3u] = b1;
++  out_buf[base + 4u] = x0;
++  out_buf[base + 5u] = x1;
++  out_buf[base + 6u] = x2;
++  out_buf[base + 7u] = x3;
++}}
++)""",
++                     vtxStride, posOffset, DebugComputeRepro::kMaxVertices * 4);
++}
++
++const wgpu::ComputePipeline& compute_repro_pipeline(uint32_t kind, uint32_t vtxStride, uint32_t posOffset,
++                                                    uint32_t arrayStride) {
++  auto& cr = g_debugCompute;
++  for (const auto& p : cr.pipelines) {
++    if (p.kind == kind && p.vtxStride == vtxStride && p.posOffset == posOffset && p.arrayStride == arrayStride) {
++      return p.pipeline;
++    }
++  }
++  if (!cr.layout) {
++    const std::array entries{
++        wgpu::BindGroupLayoutEntry{
++            .binding = 0,
++            .visibility = wgpu::ShaderStage::Compute,
++            .buffer = {.type = wgpu::BufferBindingType::ReadOnlyStorage},
++        },
++        wgpu::BindGroupLayoutEntry{
++            .binding = 1,
++            .visibility = wgpu::ShaderStage::Compute,
++            .buffer = {.type = wgpu::BufferBindingType::ReadOnlyStorage},
++        },
++        wgpu::BindGroupLayoutEntry{
++            .binding = 2,
++            .visibility = wgpu::ShaderStage::Compute,
++            .buffer = {.type = wgpu::BufferBindingType::Storage},
++        },
++        wgpu::BindGroupLayoutEntry{
++            .binding = 3,
++            .visibility = wgpu::ShaderStage::Compute,
++            .buffer = {.type = wgpu::BufferBindingType::Uniform},
++        },
++    };
++    const wgpu::BindGroupLayoutDescriptor descriptor{
++        .label = "Compute repro layout",
++        .entryCount = entries.size(),
++        .entries = entries.data(),
++    };
++    cr.layout = g_device.CreateBindGroupLayout(&descriptor);
++  }
++  const auto source = kind == 0 ? compute_repro_source(vtxStride, posOffset, arrayStride)
++                                : compute_diag_source(vtxStride, posOffset);
++  const wgpu::ShaderSourceWGSL wgslSource{wgpu::ShaderSourceWGSL::Init{
++      .code = source.c_str(),
++  }};
++  const auto label = fmt::format("Compute repro kind={} stride={} off={} arr={}", kind, vtxStride, posOffset, arrayStride);
++  const wgpu::ShaderModuleDescriptor moduleDescriptor{
++      .nextInChain = &wgslSource,
++      .label = label.c_str(),
++  };
++  const auto module = g_device.CreateShaderModule(&moduleDescriptor);
++  const wgpu::PipelineLayoutDescriptor layoutDescriptor{
++      .bindGroupLayoutCount = 1,
++      .bindGroupLayouts = &cr.layout,
++  };
++  const auto pipelineLayout = g_device.CreatePipelineLayout(&layoutDescriptor);
++  const wgpu::ComputePipelineDescriptor pipelineDescriptor{
++      .label = label.c_str(),
++      .layout = pipelineLayout,
++      .compute =
++          wgpu::ComputeState{
++              .module = module,
++              .entryPoint = "cs_main",
++          },
++  };
++  cr.pipelines.push_back(DebugComputeRepro::Pipeline{
++      .kind = kind,
++      .vtxStride = vtxStride,
++      .posOffset = posOffset,
++      .arrayStride = arrayStride,
++      .pipeline = g_device.CreateComputePipeline(&pipelineDescriptor),
++  });
++  Log.info("compute repro: pipeline kind={} created for stride={} off={} arr={}", kind, vtxStride, posOffset, arrayStride);
++  return cr.pipelines.back().pipeline;
++}
++
++// Encodes the replay into the batch's command buffer after the staging copies.
++void encode_compute_repro(const wgpu::CommandEncoder& cmd) {
++  auto& cr = g_debugCompute;
++  if (!cr.request || cr.pending) {
++    return;
++  }
++  cr.inFlight = std::move(*cr.request);
++  cr.request.reset();
++  const auto& req = cr.inFlight;
++  if (!cr.params) {
++    const wgpu::BufferDescriptor paramsDesc{
++        .label = "Compute repro params",
++        .usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst,
++        .size = 16,
++    };
++    cr.params = g_device.CreateBuffer(&paramsDesc);
++    const wgpu::BufferDescriptor outDesc{
++        .label = "Compute repro output",
++        .usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc,
++        .size = DebugComputeRepro::kOutBytes,
++    };
++    cr.output = g_device.CreateBuffer(&outDesc);
++    const wgpu::BufferDescriptor rbDesc{
++        .label = "Compute repro readback",
++        .usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
++        .size = DebugComputeRepro::kOutBytes,
++    };
++    cr.readback = g_device.CreateBuffer(&rbDesc);
++  }
++  const std::array<uint32_t, 4> params{req.vtxStart, req.arrayStart, req.count, 0};
++  // Written through the batch's own command buffer (a mapped-at-creation source buffer plus a
++  // copy) rather than g_queue.WriteBuffer: end_batch may run on the producer thread while the
++  // render thread submits.
++  {
++    const wgpu::BufferDescriptor srcDesc{
++        .label = "Compute repro params source",
++        .usage = wgpu::BufferUsage::CopySrc,
++        .size = sizeof(params),
++        .mappedAtCreation = true,
++    };
++    const auto src = g_device.CreateBuffer(&srcDesc);
++    std::memcpy(src.GetMappedRange(0, sizeof(params)), params.data(), sizeof(params));
++    src.Unmap();
++    cmd.CopyBufferToBuffer(src, 0, cr.params, 0, sizeof(params));
++  }
++  // Copies, not references: the second call may push_back into cr.pipelines and move the
++  // vector, which left the first reference dangling (Fix AE).
++  const wgpu::ComputePipeline pipeline = compute_repro_pipeline(0, req.vtxStride, req.posOffset, req.arrayStride);
++  const wgpu::ComputePipeline diagPipeline = compute_repro_pipeline(1, req.vtxStride, req.posOffset, req.arrayStride);
++  const std::array bindGroupEntries{
++      wgpu::BindGroupEntry{.binding = 0, .buffer = g_vertexBuffer, .size = VertexBufferSize},
++      wgpu::BindGroupEntry{.binding = 1, .buffer = g_storageBuffer, .size = StorageBufferSize},
++      wgpu::BindGroupEntry{.binding = 2, .buffer = cr.output, .size = DebugComputeRepro::kOutBytes},
++      wgpu::BindGroupEntry{.binding = 3, .buffer = cr.params, .size = 16},
++  };
++  const wgpu::BindGroupDescriptor bindGroupDescriptor{
++      .label = "Compute repro bind group",
++      .layout = cr.layout,
++      .entryCount = bindGroupEntries.size(),
++      .entries = bindGroupEntries.data(),
++  };
++  const auto bindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
++  const wgpu::ComputePassDescriptor passDescriptor{.label = "Compute repro pass"};
++  const auto pass = cmd.BeginComputePass(&passDescriptor);
++  pass.SetPipeline(pipeline);
++  pass.SetBindGroup(0, bindGroup);
++  pass.DispatchWorkgroups((req.count + 63) / 64);
++  pass.SetPipeline(diagPipeline);
++  pass.SetBindGroup(0, bindGroup);
++  pass.DispatchWorkgroups((req.count + 63) / 64);
++  pass.End();
++  cmd.CopyBufferToBuffer(cr.output, 0, cr.readback, 0, DebugComputeRepro::kOutBytes);
++  cr.pending = true;
++  cr.frame = g_frameIndex;
++}
++
++void complete_compute_repro() {
++  auto& cr = g_debugCompute;
++  if (!cr.pending) {
++    return;
++  }
++  cr.pending = false;
++  const auto& req = cr.inFlight;
++  const uint64_t bytes = DebugComputeRepro::kOutBytes;
++  wgpu::MapAsyncStatus mapStatus = wgpu::MapAsyncStatus::CallbackCancelled;
++  const auto future = cr.readback.MapAsync(wgpu::MapMode::Read, 0, bytes, wgpu::CallbackMode::WaitAnyOnly,
++                                           [&mapStatus](wgpu::MapAsyncStatus status, wgpu::StringView) {
++                                             mapStatus = status;
++                                           });
++  const auto waitStatus = g_instance.WaitAny(future, 5000000000);
++  if (waitStatus != wgpu::WaitStatus::Success || mapStatus != wgpu::MapAsyncStatus::Success) {
++    Log.warn("compute repro frame {}: map failed wait={} map={}", cr.frame, magic_enum::enum_name(waitStatus),
++             magic_enum::enum_name(mapStatus));
++    return;
++  }
++  const auto* gpu = static_cast<const uint32_t*>(cr.readback.GetConstMappedRange(0, bytes));
++  const uint32_t* diag = gpu + static_cast<size_t>(DebugComputeRepro::kMaxVertices) * 4;
++  // Per formulation: how many vertices read the index bytes wrongly (w0, w1, b0, b1, x0..x3).
++  std::array<uint32_t, 8> diagWrong{};
++  uint32_t diagCompared = 0;
++  uint32_t idxMismatches = 0;
++  uint32_t posMismatches = 0;
++  uint32_t straddling = 0; // vertices whose 16-bit index crosses a 4-byte word boundary
++  std::string sample;
++  uint32_t sampled = 0;
++  for (uint32_t v = 0; v < req.count; ++v) {
++    const uint32_t* e = req.expected.data() + static_cast<size_t>(v) * 4;
++    const uint32_t* g = gpu + static_cast<size_t>(v) * 4;
++    const bool idxBad = e[0] != g[0];
++    const bool posBad = e[1] != g[1] || e[2] != g[2] || e[3] != g[3];
++    const uint32_t indexByte = req.vtxStart + v * req.vtxStride + req.posOffset;
++    const bool straddles = (indexByte & 3u) == 3u;
++    if (straddles) {
++      ++straddling;
++    }
++    if (idxBad) {
++      ++idxMismatches;
++    }
++    if (posBad) {
++      ++posMismatches;
++    }
++    const uint32_t* ew = req.expectedWords.data() + static_cast<size_t>(v) * 4;
++    const uint32_t* d = diag + static_cast<size_t>(v) * 8;
++    if (ew[0] != UINT32_MAX && ew[1] != UINT32_MAX) {
++      ++diagCompared;
++      diagWrong[0] += d[0] != ew[0];
++      diagWrong[1] += d[1] != ew[1];
++      diagWrong[2] += d[2] != ew[2];
++      diagWrong[3] += d[3] != ew[3];
++      for (size_t k = 4; k < 8; ++k) {
++        diagWrong[k] += d[k] != ew[2];
++      }
++    }
++    if ((idxBad || posBad) && sampled < 6) {
++      ++sampled;
++      sample += fmt::format(" [v{} byte {:#x} sub={}: idx cpu={} gpu={} w0 {:#010x}/{:#010x} w1 {:#010x}/{:#010x} b0 {}/{} b1 {}/{} "
++                            "ext={} sel={} sw={} inl={} pos cpu=({:g},{:g},{:g}) gpu=({:g},{:g},{:g})]",
++                            v, indexByte, indexByte & 3u, e[0], g[0], ew[0], d[0], ew[1], d[1], ew[2], d[2], ew[3], d[3],
++                            d[4], d[5], d[6], d[7], std::bit_cast<float>(e[1]),
++                            std::bit_cast<float>(e[2]), std::bit_cast<float>(e[3]), std::bit_cast<float>(g[1]),
++                            std::bit_cast<float>(g[2]), std::bit_cast<float>(g[3]));
++    }
++  }
++  if (idxMismatches == 0 && posMismatches == 0) {
++    Log.info("compute repro frame {}: stride={} off={} arr={} vtx_start={:#x} array_start={:#x} count={} "
++             "({} straddling): index and position IDENTICAL to the CPU -> fault is vertex-stage specific",
++             cr.frame, req.vtxStride, req.posOffset, req.arrayStride, req.vtxStart, req.arrayStart, req.count,
++             straddling);
++  } else {
++    Log.warn("compute repro frame {}: stride={} off={} arr={} vtx_start={:#x} array_start={:#x} count={} "
++             "({} straddling): {} index and {} position mismatches -> reproduces in compute{}",
++             cr.frame, req.vtxStride, req.posOffset, req.arrayStride, req.vtxStart, req.arrayStart, req.count,
++             straddling, idxMismatches, posMismatches, sample);
++  }
++  Log.info("compute diag frame {}: of {} vertices wrong: w0={} w1={} b0(load_u8)={} b1={} extractBits={} select={} "
++           "switch={} inline_shift={}",
++           cr.frame, diagCompared, diagWrong[0], diagWrong[1], diagWrong[2], diagWrong[3], diagWrong[4], diagWrong[5],
++           diagWrong[6], diagWrong[7]);
++  cr.readback.Unmap();
++}
++} // namespace
++
++bool debug_compute_repro_wanted() noexcept {
++  const auto& cr = g_debugCompute;
++  return (gx::gx_debug_flags() & gx::GxDebugComputeRepro) != 0 && !cr.pending && !cr.request &&
++         cr.lastRecordedFrame != g_frameIndex && g_frameIndex % 180 == 60;
++}
++
++void debug_compute_repro_record(DebugComputeReproRequest&& request) {
++  auto& cr = g_debugCompute;
++  if (request.count > DebugComputeRepro::kMaxVertices) {
++    request.count = DebugComputeRepro::kMaxVertices;
++    request.expected.resize(static_cast<size_t>(request.count) * 4);
++    request.expectedWords.resize(static_cast<size_t>(request.count) * 4);
++  }
++  cr.lastRecordedFrame = g_frameIndex;
++  cr.request = std::move(request);
++}
++
+ static void end_batch_impl(const wgpu::CommandEncoder& cmd, bool advanceFrame) {
+   ZoneScoped;
+   ASSERT(!g_inOffscreen, "end_frame called while offscreen rendering is active");
+@@ -1128,6 +1583,8 @@
+   g_stats.lastUniformSize = writeBuffer(g_uniforms, g_uniformBuffer, UniformBufferSize, "Uniform");
+   g_stats.lastIndexSize = writeBuffer(g_indices, g_indexBuffer, IndexBufferSize, "Index");
+   g_stats.lastStorageSize = writeBuffer(g_storage, g_storageBuffer, StorageBufferSize, "Storage");
++  // Quest-3 diagnostics (bit 2048): replay of one draw's index fetch, reads the buffers just copied.
++  encode_compute_repro(cmd);
+   if constexpr (UseTextureBuffer) {
+     g_stats.lastTextureUploadSize = g_textureUpload.size();
+     {
+@@ -1525,6 +1982,13 @@
+   return {static_cast<uint32_t>(begin), static_cast<uint32_t>(length + padding)};
+ }
+ Range push_verts(const uint8_t* data, size_t length) { return push(g_verts, data, length, 0); }
++size_t verts_remaining() noexcept { return g_verts.size() < VertexBufferSize ? VertexBufferSize - g_verts.size() : 0; }
++void align_verts(size_t alignment) {
++  const size_t rem = g_verts.size() % alignment;
++  if (rem != 0) {
++    g_verts.append_zeroes(alignment - rem);
++  }
++}
+ Range push_indices(const uint8_t* data, size_t length) { return push(g_indices, data, length, 0); }
+ Range push_uniform(const uint8_t* data, size_t length) {
+   return push(g_uniforms, data, length, g_cachedLimits.minUniformBufferOffsetAlignment);
+--- a/aurora-main/lib/aurora.cpp
++++ b/aurora-main/lib/aurora.cpp
+@@ -1423,6 +1423,8 @@
+     const auto buffer = target.Finish(&cmdBufDescriptor);
+     std::lock_guard submitLock(g_queueSubmitMutex);
+     g_queue.Submit(1, &buffer);
++    // Quest-3 diagnostics (AURORA_GX_DEBUG bit 2048); returns at once unless a compute replay is pending.
++    gfx::debug_complete_readback();
+   };
+ 
+   if (ctx.replayInterpolatedFrames) {
+--- a/aurora-main/lib/webgpu/gpu.cpp
++++ b/aurora-main/lib/webgpu/gpu.cpp
+@@ -7,6 +7,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <mutex>
++#include <string>
+ #include <string_view>
+ #include <utility>
+ #include <vector>
+@@ -682,17 +683,71 @@
+       "enable_immediate_error_handling",
+         /* clang-format on */
+     };
++    // Quest-3 diagnostics, all read from the environment so a release build can be
++    // re-run with Dawn's validation and Tint's robustness clamps on, or with any
++    // Dawn toggle switched, without rebuilding:
++    //   AURORA_DAWN_VALIDATION=1        keep skip_validation/disable_robustness off
++    //   AURORA_DAWN_ENABLE_TOGGLES=a,b  extra toggles to enable
++    //   AURORA_DAWN_DISABLE_TOGGLES=c   toggles to force off (Dawn's own defaults included)
++    const auto envFlag = [](const char* name) {
++      const char* value = std::getenv(name);
++      return value != nullptr && *value != '\0' && *value != '0';
++    };
++    static std::vector<std::string> envEnableToggles;
++    static std::vector<std::string> envDisableToggles;
++    const auto splitEnvList = [](const char* name, std::vector<std::string>& out) {
++      out.clear();
++      const char* value = std::getenv(name);
++      if (value == nullptr) {
++        return;
++      }
++      std::string_view rest{value};
++      while (!rest.empty()) {
++        const size_t comma = rest.find(',');
++        const std::string_view item = rest.substr(0, comma);
++        if (!item.empty()) {
++          out.emplace_back(item);
++        }
++        rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
++      }
++    };
++    splitEnvList("AURORA_DAWN_ENABLE_TOGGLES", envEnableToggles);
++    splitEnvList("AURORA_DAWN_DISABLE_TOGGLES", envDisableToggles);
++    const bool keepValidation = envFlag("AURORA_DAWN_VALIDATION");
+ #ifdef NDEBUG
+-    enableToggles.push_back("skip_validation");
+-    enableToggles.push_back("disable_robustness");
++    if (!keepValidation) {
++      enableToggles.push_back("skip_validation");
++      enableToggles.push_back("disable_robustness");
++    }
+ #endif
+     if (g_backendType == wgpu::BackendType::Vulkan) {
+       enableToggles.push_back("vulkan_monolithic_pipeline_cache");
+     }
++    for (const auto& toggle : envEnableToggles) {
++      enableToggles.push_back(toggle.c_str());
++    }
++    std::vector<const char*> disableToggles;
++    for (const auto& toggle : envDisableToggles) {
++      disableToggles.push_back(toggle.c_str());
++    }
++    if (keepValidation || !envEnableToggles.empty() || !envDisableToggles.empty()) {
++      std::string enabledList;
++      for (const char* toggle : enableToggles) {
++        enabledList += enabledList.empty() ? toggle : std::string(",") + toggle;
++      }
++      std::string disabledList;
++      for (const char* toggle : disableToggles) {
++        disabledList += disabledList.empty() ? toggle : std::string(",") + toggle;
++      }
++      Log.warn("Dawn toggles from environment: validation={} enabled=[{}] disabled=[{}]", keepValidation,
++               enabledList, disabledList);
++    }
+     const wgpu::DawnTogglesDescriptor togglesDescriptor({
+         .nextInChain = &cacheDescriptor,
+         .enabledToggleCount = enableToggles.size(),
+         .enabledToggles = enableToggles.data(),
++        .disabledToggleCount = disableToggles.size(),
++        .disabledToggles = disableToggles.data(),
+     });
+ #endif
+     wgpu::DeviceDescriptor deviceDescriptor;
+--- a/runtime/include/fiber_manager.h
++++ b/runtime/include/fiber_manager.h
+@@ -97,6 +97,13 @@
+     static bool HasFiber(uint32_t guestThreadAddr);
+     static bool IsTerminated(uint32_t guestThreadAddr);
+ 
++    // True while the scheduler context (the host thread's own stack, which is also
++    // the main guest thread's fiber) is executing; false on every other guest fiber.
++    // Quest-3 note: Android's ART validates JNI references against the thread's
++    // stack bounds, so anything that can reach Java (SDL's event pump, haptics)
++    // must only run when this is true.
++    static bool IsSchedulerContextActive();
++
+ private:
+     // The fiber entry point wrapper
+ #if defined(_WIN32)
+--- a/runtime/include/aurora_events.h
++++ b/runtime/include/aurora_events.h
+@@ -2,6 +2,7 @@
+ 
+ #include "settings_overlay.h"
+ #include "runtime_config.h"
++#include "fiber_manager.h"
+ 
+ #include <aurora/aurora.h>
+ #include <aurora/event.h>
+@@ -138,5 +139,18 @@
+ 
+ // Poll Aurora events and update cached window/framebuffer dimensions.
+ inline void UpdateAuroraAndProcessEvents() {
++#if defined(__ANDROID__)
++    // aurora_update() pumps SDL, and SDL's periodic joystick enumeration calls into
++    // Java (SDLControllerManager.pollInputDevices -> InputDevice.getDevice -> binder).
++    // ART checks the JNI references of that call against the thread's stack bounds;
++    // a libco guest fiber runs on a malloc'ed stack, so the check fails and ART aborts
++    // the process ("jobject is an invalid JNI transition frame reference", the
++    // sporadic SIGABRT). Only the main guest thread runs on
++    // the thread's own stack; every other fiber leaves the pump to the next retrace
++    // the main thread advances. Presentation is not affected by this early return.
++    if (!Fiber::GuestFiberManager::IsSchedulerContextActive()) {
++        return;
++    }
++#endif
+     ProcessAuroraEvents(aurora_update());
+ }
+--- a/runtime/src/settings_overlay.cpp
++++ b/runtime/src/settings_overlay.cpp
+@@ -967,6 +967,13 @@
+ // Runs on the thread that pumps SDL events (the same one that calls Draw), so
+ // the SDL cursor calls are safe here.
+ void UpdateCursorAutoHide() {
++#if defined(__ANDROID__)
++    // No mouse cursor on the Quest panel, and SDL_HideCursor/ShowCursor go through
++    // JNI to IWindowSession.updatePointerIcon (a binder call). Draw() runs inside
++    // the VI retrace, which any guest fiber may drive; ART rejects JNI references
++    // from a libco fiber stack and aborts the process (Fix AB).
++    return;
++#endif
+     const bool shouldHide =
+         !g_topBarVisible && Clock::now() - g_lastMouseActivity >= kCursorAutoHideDelay;
+     if (shouldHide == g_cursorHidden) {
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -1475,6 +1475,38 @@
+         // visible on that first scan.
+         WiiRemoteInput::ConfigureSdlHints(RuntimeConfigFile::WiiRemotesEnabled(true));
+ 
++        // [debug] renderer diagnostics from Config.toml. aurora reads these from the
++        // environment (lib/gx/shader_info.cpp, lib/webgpu/gpu.cpp), and a variable that
++        // was already set outside (a desktop shell) wins over the configuration file.
++        {
++            const auto exportSetting = [](const char* name, const std::string& value) {
++                if (value.empty()) {
++                    return;
++                }
++#if defined(_WIN32)
++                if (std::getenv(name) == nullptr) {
++                    _putenv_s(name, value.c_str());
++                }
++#else
++                ::setenv(name, value.c_str(), 0);
++#endif
++                RT_LOG(RT_TAG_RUNTIME) << "[debug] " << name << "=" << value << std::endl;
++            };
++            if (const auto flags = RuntimeConfigFile::DebugAuroraGxFlags(); flags && *flags != 0) {
++                exportSetting("AURORA_GX_DEBUG", std::to_string(*flags));
++            }
++            if (const auto deindex = RuntimeConfigFile::DebugAuroraDeindex()) {
++                exportSetting("AURORA_GX_DEINDEX", *deindex ? "1" : "0");
++            }
++            if (RuntimeConfigFile::DebugDawnValidation().value_or(false)) {
++                exportSetting("AURORA_DAWN_VALIDATION", "1");
++            }
++            exportSetting("AURORA_DAWN_ENABLE_TOGGLES",
++                          RuntimeConfigFile::DebugDawnEnableToggles().value_or(std::string{}));
++            exportSetting("AURORA_DAWN_DISABLE_TOGGLES",
++                          RuntimeConfigFile::DebugDawnDisableToggles().value_or(std::string{}));
++        }
++
+         const AuroraInfo auroraInfo = aurora_initialize(0, nullptr, &auroraConfig);
+         if (requestedBackend != BACKEND_AUTO && auroraInfo.backend != requestedBackend) {
+             RT_LOG(RT_TAG_RUNTIME) << "graphics_api=\"" << backend
+--- a/runtime/include/runtime_config.h
++++ b/runtime/include/runtime_config.h
+@@ -45,6 +45,13 @@
+     std::optional<bool> textureReplacements;
+     std::optional<bool> textureDumps;
+     std::optional<bool> showFps;
++    // [debug] section, see ParseUserConfig: renderer diagnostics handed to aurora
++    // through environment variables (AURORA_GX_DEBUG, AURORA_DAWN_*).
++    std::optional<uint32_t> debugAuroraGxFlags;
++    std::optional<bool> debugAuroraDeindex; // Adreno-740 workaround, default on for Android
++    std::optional<bool> debugDawnValidation;
++    std::optional<std::string> debugDawnEnableToggles;
++    std::optional<std::string> debugDawnDisableToggles;
+     std::optional<uint32_t> disabledPostProcessingPaths;
+     std::optional<float> audioVolume;
+     std::optional<float> audioMusicVolume;
+@@ -441,6 +448,13 @@
+     config.skipUnreadyPipelines = FindConfigValue<bool>(document, "video", "skip_unready_pipelines");
+     config.disableCopyFilter = FindConfigValue<bool>(document, "video", "disable_copy_filter");
+     config.showFps = FindConfigValue<bool>(document, "video", "show_fps");
++    // [debug] renderer diagnostics; exported to aurora as environment variables before
++    // aurora_initialize (main.cpp). Only read, never written by the overlay.
++    config.debugAuroraGxFlags = FindConfigUint(document, "debug", "aurora_gx_debug");
++    config.debugAuroraDeindex = FindConfigValue<bool>(document, "debug", "aurora_deindex");
++    config.debugDawnValidation = FindConfigValue<bool>(document, "debug", "dawn_validation");
++    config.debugDawnEnableToggles = FindConfigValue<std::string>(document, "debug", "dawn_enable_toggles");
++    config.debugDawnDisableToggles = FindConfigValue<std::string>(document, "debug", "dawn_disable_toggles");
+     config.textureReplacements = FindConfigValue<bool>(document, "video", "texture_replacements");
+     config.textureDumps = FindConfigValue<bool>(document, "video", "texture_dumps");
+     if (auto value = FindConfigUint(document, "video", "disabled_post_processing_paths");
+@@ -885,6 +899,12 @@
+     return Get().graphicsApi.value_or(std::move(fallback));
+ }
+ 
++inline std::optional<uint32_t> DebugAuroraGxFlags() { return Get().debugAuroraGxFlags; }
++inline std::optional<bool> DebugAuroraDeindex() { return Get().debugAuroraDeindex; }
++inline std::optional<bool> DebugDawnValidation() { return Get().debugDawnValidation; }
++inline std::optional<std::string> DebugDawnEnableToggles() { return Get().debugDawnEnableToggles; }
++inline std::optional<std::string> DebugDawnDisableToggles() { return Get().debugDawnDisableToggles; }
++
+ inline std::string DisplayMode(std::string fallback = "windowed") {
+     return Get().displayMode.value_or(std::move(fallback));
+ }
+--- a/runtime/src/fiber_manager.cpp
++++ b/runtime/src/fiber_manager.cpp
+@@ -221,6 +221,11 @@
+     return s_initialized;
+ }
+ 
++bool GuestFiberManager::IsSchedulerContextActive() {
++    // Before the scheduler exists everything runs on the plain thread stack.
++    return !s_initialized || s_schedulerFiber == nullptr || HostContext::IsCurrent(s_schedulerFiber);
++}
++
+ bool GuestFiberManager::CreateGuestFiber(uint32_t guestThreadAddr, uint32_t entryPoint,
+                                           uint32_t entryArg, uint32_t stackBase) {
+     if (!s_initialized) {
+@@ -256,7 +261,11 @@
+     gf.cpuContext.srr0 = entryPoint;
+     
+     // The host stack models only translated host calls; the guest stack starts
+-    // at stackBase in the CPU context above.
++    // at stackBase in the CPU context above. 64 KiB is too small for deep
++    // translated/HLE call chains (notably NW4R's sound worker), and on macOS
++    // it can exhaust the guarded coroutine stack as unrelated host work (such
++    // as a window resize) adds a little more nesting. Keep enough headroom for
++    // those chains while the guest stack remains separately bounded.
+     constexpr size_t kHostStackSize = 1024 * 1024;
+     gf.fiber = HostContext::Create(kHostStackSize, FiberProc,
+                                    reinterpret_cast<void*>(static_cast<uintptr_t>(guestThreadAddr)));

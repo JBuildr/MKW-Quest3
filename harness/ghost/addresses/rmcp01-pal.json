@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "game_id": "RMCP01",
+  "verified": true,
+  "verified_by": "gemeinsam am laufenden Spiel gemessen (RetroRewind, PID 21640, 2026-09-05)",
+  "verified_note": "BELEGT DURCH MESSUNG, NICHT UEBERNOMMEN. (1) Der Framezaehler wurde mehrfach mit 60,0-60,4 Schritten je Sekunde gemessen und liegt im statischen Bereich. (2) Die vier Kartpunkte wurden ueber die Physik gefunden: ein daneben liegender Vektor zeigte exakt entlang der Bewegung (cos = 1,00000). (3) Der entscheidende Gegentest: waehrend der Framezaehler mit exakt 60/s weiterlief, sind alle vier Werte eingefroren, sobald das Kart stand, und liefen beim Anfahren wieder los - damit sind es weder Ghost noch Streckenanimation. (4) Die Objektadressen aendern sich zwischen Rennen (0x809C9B70 -> 0x809CAD90 beobachtet), die statischen Zeiger 0x80398030..3C bleiben. NICHT ERMITTELT: was die vier Punkte genau darstellen (Raeder oder Ecken des Karts, jeweils rund 20-70 Einheiten auseinander). Fuer die Paritaetspruefung ist das unerheblich - sie liegen hinter der vollstaendigen Physik und zeigen jede Abweichung.",
+  "_hinweis_reihenfolge": "Die Reihenfolge geht in die Pruefsumme ein. Wird sie geaendert, sind alle bestehenden Referenzen ungueltig.",
+  "fields": [
+    {
+      "name": "race_frame",
+      "address": "0x8034750C",
+      "kind": "u32",
+      "note": "Framezaehler des Rennens, statisch. Gemessen 60,0-60,4/s. Dient als Zeitachse der Stichproben und ersetzt die Endzeit, solange kein Millisekundenzaehler gefunden ist. Bewusst NICHT in der Pruefsumme: der Zaehler ist die Zeitachse, unter der verglichen wird.",
+      "in_checksum": false
+    },
+    {
+      "name": "kart_point_0",
+      "address": "",
+      "via_pointer": "0x80398030",
+      "offset": 88,
+      "kind": "vec3",
+      "note": "Erster von vier Punkten am Kart des Spielers. Zeiger statisch, Objekt im Heap. Friert im Stand ein."
+    },
+    {
+      "name": "kart_point_1",
+      "address": "",
+      "via_pointer": "0x80398034",
+      "offset": 88,
+      "kind": "vec3",
+      "note": "Zweiter Punkt, gleiche Struktur."
+    },
+    {
+      "name": "kart_point_2",
+      "address": "",
+      "via_pointer": "0x80398038",
+      "offset": 88,
+      "kind": "vec3",
+      "note": "Dritter Punkt, gleiche Struktur."
+    },
+    {
+      "name": "kart_point_3",
+      "address": "",
+      "via_pointer": "0x8039803C",
+      "offset": 88,
+      "kind": "vec3",
+      "note": "Vierter Punkt, gleiche Struktur."
+    }
+  ],
+  "_nicht_ermittelt": {
+    "race_timer_ms": "Kein streng monotoner u32 mit rund 1000 Schritten je Sekunde gefunden. Die Rennzeit duerfte in MKW als Framezahl oder als Struktur mit getrennten Minuten/Sekunden/Millisekunden vorliegen. Bis das geklaert ist, wird die Endzeit aus race_frame abgeleitet (60 fps).",
+    "player_velocity": "Ein passender Vektor wurde gefunden (cos = 1,00000 zur Bewegungsrichtung), aber noch nicht auf einen statischen Zeiger zurueckgefuehrt. Waere nuetzlich, weil Geschwindigkeit eine Abweichung frueher zeigt als Position."
+  }
+}

@@ -1,0 +1,120 @@
+# ---------------------------------------------------------------------------
+# HART: niemals einchecken.
+# ---------------------------------------------------------------------------
+
+# Lokale Maschinenpfade (enthaelt Pfade zu Spieldaten und Zugangsdaten)
+local.paths.md
+# Generator dazu - hardcodet lokale Suchpfade
+tools/00-discover-paths-v2.ps1
+
+# --- Spieldaten: Images, Disc-Inhalte, Code- und Asset-Container ------------
+*.iso
+*.rvz
+*.wbfs
+*.wia
+*.ciso
+*.gcm
+*.nkit
+*.nkit.iso
+*.wad
+*.dol
+*.elf.dol
+*.rel
+*.szs
+*.brres
+*.bmg
+*.thp
+*.brstm
+*.brsar
+*.arc
+*.u8
+*.carc
+
+# --- Ghosts / Replays / Saves ----------------------------------------------
+*.rkg
+*.rksys
+*.dat.sav
+*.raw
+
+# --- Ordner, in denen Spieldaten landen koennten ---------------------------
+gamedata/
+GameAssets/
+DATA/
+ghosts/
+Ghosts/
+saves/
+dvdroot/
+dvd_root/
+
+# --- Buildartefakte --------------------------------------------------------
+build/
+build-*/
+out/
+bin/
+obj/
+dist/
+install/
+_deps/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
+.ninja_deps
+.ninja_log
+*.ninja
+!build.ninja.in
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.apk
+*.aab
+*.keystore
+*.jks
+
+# --- .NET ------------------------------------------------------------------
+[Bb]in/
+[Oo]bj/
+*.user
+*.suo
+project.lock.json
+artifacts/
+
+# --- Vendor: geklonte Fremdrepos, nicht Teil dieses Repos ------------------
+vendor/
+
+# --- Generierter Uebersetzer-Output (enthaelt Spielcode!) ------------------
+generated/
+translated/
+recomp-out/
+
+# --- Werkzeug-/Editor-Kram -------------------------------------------------
+.vs/
+.vscode/
+.idea/
+*.swp
+*~
+Thumbs.db
+desktop.ini
+
+# --- Python (Harness) ------------------------------------------------------
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# --- Logs (koennen Pfade oder Speicherinhalte enthalten) -------------------
+*.log
+logs/
+
+# --- Arbeitsnotizen: bleiben lokal, nie im oeffentlichen Repo ---
+docs/
