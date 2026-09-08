@@ -1,0 +1,586 @@
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -11,11 +11,19 @@
+     # The first native macOS target is Apple Silicon. Intel and universal
+     # binaries remain future compatibility work; do not silently claim them.
+     set(MKW_PLATFORM_MACOS TRUE)
++elseif(CMAKE_SYSTEM_NAME STREQUAL "Android" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
++    # Android is a Linux kernel with bionic instead of glibc. Everything the
++    # Linux branch turns on is present here: libco's aarch64 backend, POSIX
++    # mmap/mprotect for the flat guest memory, dlopen in libc. So Android is
++    # the Linux platform plus a marker for the places where bionic and the
++    # NDK genuinely differ (no dbus, no X11, APK-relative asset paths).
++    set(MKW_PLATFORM_LINUX TRUE)
++    set(MKW_PLATFORM_ANDROID TRUE)
+ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64|aarch64|arm64|ARM64)$")
+     set(MKW_PLATFORM_LINUX TRUE)
+ else()
+     message(FATAL_ERROR
+-        "WiiCompiled supports 64-bit LLVM-MinGW Clang on Windows, native Linux x86_64/aarch64, or Apple Clang on macOS arm64")
++        "WiiCompiled supports 64-bit LLVM-MinGW Clang on Windows, native Linux x86_64/aarch64, Android arm64-v8a, or Apple Clang on macOS arm64")
+ endif()
+ if(NOT CMAKE_BUILD_TYPE STREQUAL "Release")
+     message(FATAL_ERROR "WiiCompiled only supports Release builds")
+@@ -105,6 +113,23 @@
+     target_compile_definitions(mkw_cryptopp PUBLIC ${MKW_CRYPTOPP_INTERFACE_DEFINITIONS})
+     target_compile_options(mkw_cryptopp PRIVATE -w)
+     set_target_properties(mkw_cryptopp PROPERTIES UNITY_BUILD OFF)
++    if(MKW_PLATFORM_ANDROID)
++        # cpu.cpp includes "cpu-features.h" unconditionally under __ANDROID__.
++        # That header and its implementation ship with the NDK but sit outside
++        # the default include path, and CMake 4 no longer carries the
++        # AndroidNdkModules helper that used to import them. Compile the NDK's
++        # own source into the archive instead of vendoring a second copy.
++        set(MKW_ANDROID_CPUFEATURES_DIR
++            "${CMAKE_ANDROID_NDK}/sources/android/cpufeatures")
++        if(NOT EXISTS "${MKW_ANDROID_CPUFEATURES_DIR}/cpu-features.c")
++            message(FATAL_ERROR
++                "NDK cpufeatures not found at ${MKW_ANDROID_CPUFEATURES_DIR}")
++        endif()
++        target_sources(mkw_cryptopp PRIVATE
++            "${MKW_ANDROID_CPUFEATURES_DIR}/cpu-features.c")
++        target_include_directories(mkw_cryptopp SYSTEM PRIVATE
++            "${MKW_ANDROID_CPUFEATURES_DIR}")
++    endif()
+ endif()
+ 
+ set(MKW_TRANSLATED_COMPILE_JOBS 0 CACHE STRING
+--- a/runtime/cmake/PublicProducts.cmake
++++ b/runtime/cmake/PublicProducts.cmake
+@@ -237,6 +237,14 @@
+         # objects (empty string on glibc >= 2.34, where dl* is in libc).
+         target_link_libraries(${target} PRIVATE mkw::libco ${CMAKE_DL_LIBS})
+     endif()
++    if(MKW_PLATFORM_ANDROID)
++        # The NDK toolchain appends -g to every configuration, Release included.
++        # Across 29k translated functions that turns the linked product into a
++        # 1.1 GB file and makes the link itself need the memory to hold it. An
++        # APK reads none of those sections, so drop them in the linker rather
++        # than writing them out and stripping afterwards.
++        target_link_options(${target} PRIVATE -Wl,--strip-debug)
++    endif()
+     if(MKW_PLATFORM_WINDOWS)
+         foreach(runtime_dll libc++.dll libunwind.dll)
+             execute_process(
+@@ -288,7 +296,17 @@
+         "$<TARGET_FILE_DIR:${target}>/initial_pipeline_cache.db")
+ endfunction()
+ 
+-add_executable(WiiCompiled "${MKW_BASE_PRODUCT_SOURCE}" ${MKW_BASE_REGISTRATION_SOURCES})
++# An Android app has no process entry point of its own to hand a main() to:
++# SDLActivity dlopen()s a shared library and dlsym()s SDL_main out of it. So the
++# products are the same code linked as shared libraries there. They keep their
++# target names -- both carry SDL_main, and naming both of them libmain.so would
++# be two build rules writing one file. Whichever one is packaged is renamed to
++# the name SDLActivity.getLibraries() reports, at packaging time.
++if(MKW_PLATFORM_ANDROID)
++    add_library(WiiCompiled SHARED "${MKW_BASE_PRODUCT_SOURCE}" ${MKW_BASE_REGISTRATION_SOURCES})
++else()
++    add_executable(WiiCompiled "${MKW_BASE_PRODUCT_SOURCE}" ${MKW_BASE_REGISTRATION_SOURCES})
++endif()
+ mkw_configure_product(WiiCompiled)
+ target_precompile_headers(WiiCompiled PRIVATE
+     "${MKW_RUNTIME_SOURCE_DIR}/include/mkw_pch.h")
+@@ -297,7 +315,12 @@
+ endif()
+ 
+ if(MKW_HAVE_RETRO_REWIND)
+-    add_executable(RetroRewind "${MKW_RETRO_REWIND_PRODUCT_SOURCE}" ${MKW_RETRO_REGISTRATION_SOURCES})
++    if(MKW_PLATFORM_ANDROID)
++        add_library(RetroRewind SHARED
++            "${MKW_RETRO_REWIND_PRODUCT_SOURCE}" ${MKW_RETRO_REGISTRATION_SOURCES})
++    else()
++        add_executable(RetroRewind "${MKW_RETRO_REWIND_PRODUCT_SOURCE}" ${MKW_RETRO_REGISTRATION_SOURCES})
++    endif()
+     mkw_configure_product(RetroRewind)
+     target_precompile_headers(RetroRewind REUSE_FROM WiiCompiled)
+     if(TARGET mkw_retro_sensitive)
+@@ -320,7 +343,14 @@
+ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
+     set(MKW_BASELINE_ARCH_FLAG -march=x86-64-v3)
+ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+-    set(MKW_BASELINE_ARCH_FLAG -mcpu=native)
++    if(MKW_PLATFORM_ANDROID OR CMAKE_CROSSCOMPILING)
++        # -mcpu=native describes the build machine, which in a cross build is
++        # not the machine that runs the result. armv8.2-a+fp16+dotprod is the
++        # floor every Quest-class Snapdragon (XR2 Gen 2, Cortex-A78/X2) meets.
++        set(MKW_BASELINE_ARCH_FLAG -march=armv8.2-a+fp16+dotprod)
++    else()
++        set(MKW_BASELINE_ARCH_FLAG -mcpu=native)
++    endif()
+ else()
+     set(MKW_BASELINE_ARCH_FLAG "")
+ endif()
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -27,6 +27,14 @@
+ #include <unistd.h>
+ #endif
+ 
++#if defined(__ANDROID__)
++#include <SDL3/SDL_system.h>
++#include <android/log.h>
++#include <pthread.h>
++#include <dlfcn.h>
++#include <unwind.h>
++#endif
++
+ #if defined(_WIN32)
+ #ifndef NOMINMAX
+ #define NOMINMAX
+@@ -737,6 +745,54 @@
+     std::fputs(trace.c_str(), stderr);
+     std::fflush(stderr);
+     s_inProgress.clear();
++#elif defined(__ANDROID__)
++    // Without this the only thing a crash on the Quest reports is the signal
++    // number, which is not enough to find where it happened. bionic has no
++    // execinfo.h/backtrace(), but the unwinder libc++ already links for
++    // exceptions is reachable directly, and dladdr() turns the addresses into
++    // symbol names. Only what is needed to name the faulting frame -- no line
++    // numbers; those come from addr2line on the unstripped library.
++    static std::atomic_flag s_inProgress = ATOMIC_FLAG_INIT;
++    if (s_inProgress.test_and_set()) {
++        return;
++    }
++    struct Frames {
++        void* addresses[64];
++        int count;
++    } frames{{}, 0};
++    ::_Unwind_Backtrace(
++        [](_Unwind_Context* context, void* argument) -> _Unwind_Reason_Code {
++            auto* collected = static_cast<Frames*>(argument);
++            const uintptr_t pc = ::_Unwind_GetIP(context);
++            if (pc != 0 && collected->count < 64) {
++                collected->addresses[collected->count++] = reinterpret_cast<void*>(pc);
++            }
++            return collected->count < 64 ? _URC_NO_REASON : _URC_END_OF_STACK;
++        },
++        &frames);
++    std::fprintf(stderr, "[runtime] host stack trace (%d frames):\n", frames.count);
++    for (int index = 0; index < frames.count; ++index) {
++        Dl_info info{};
++        const char* symbol = "??";
++        const char* object = "??";
++        uintptr_t offset = 0;
++        if (::dladdr(frames.addresses[index], &info) != 0) {
++            if (info.dli_sname != nullptr) {
++                symbol = info.dli_sname;
++            }
++            if (info.dli_fname != nullptr) {
++                object = info.dli_fname;
++            }
++            if (info.dli_fbase != nullptr) {
++                // Offset from the library base is what addr2line wants.
++                offset = reinterpret_cast<uintptr_t>(frames.addresses[index]) -
++                         reinterpret_cast<uintptr_t>(info.dli_fbase);
++            }
++        }
++        std::fprintf(stderr, "[runtime]   #%02d pc %012zx  %s  (%s)\n", index, offset, object, symbol);
++    }
++    std::fflush(stderr);
++    s_inProgress.clear();
+ #else
+     RT_LOGF(RT_TAG_RUNTIME, "Host stack trace unavailable on this platform\n");
+     std::fflush(stderr);
+@@ -1509,6 +1565,189 @@
+     }
+ }
+ 
++#if defined(__ANDROID__)
++// There is no process entry point here to receive a main(): SDLActivity
++// dlopen()s libmain.so and dlsym()s "SDL_main" out of it, so that symbol has to
++// exist and stay visible after the linker's default-hidden pass.
++namespace {
++
++// Everything this runtime reports goes through RT_LOG/RT_LOGF, and those write
++// to std::cerr and stderr (runtime_log.h:29,33). On Android a process's stdout
++// and stderr are connected to /dev/null, so every diagnostic is discarded --
++// including the reason a refused start gave, which is exactly the message
++// worth having. Pump both into logcat, where "adb logcat -s mkw" shows them.
++void* AndroidLogPump(void* argument) {
++    const int readEnd = static_cast<int>(reinterpret_cast<intptr_t>(argument));
++    std::string line;
++    char buffer[512];
++    for (;;) {
++        const ssize_t count = ::read(readEnd, buffer, sizeof(buffer));
++        if (count <= 0) {
++            break;
++        }
++        for (ssize_t index = 0; index < count; ++index) {
++            const char character = buffer[index];
++            if (character == '\n') {
++                __android_log_write(ANDROID_LOG_INFO, "mkw", line.c_str());
++                line.clear();
++            } else if (character != '\r') {
++                line.push_back(character);
++            }
++        }
++        // A writer that never emits a newline must not grow this without bound.
++        if (line.size() >= 4096) {
++            __android_log_write(ANDROID_LOG_INFO, "mkw", line.c_str());
++            line.clear();
++        }
++    }
++    if (!line.empty()) {
++        __android_log_write(ANDROID_LOG_INFO, "mkw", line.c_str());
++    }
++    return nullptr;
++}
++
++// Reading and writing this from the host needs no run-as and no root, which is
++// what makes a sideloaded build debuggable at all. See its use below.
++constexpr const char* kAndroidPublicDataHome = "/sdcard/MKW";
++
++// Runs when the linker loads this library, before any static initializer that
++// might read the configuration. That ordering is the whole point: the parsed
++// Config.toml is cached in a function-local static on first access
++// (runtime_config.h:508) and never re-read, so whoever touches it first fixes
++// the path for the life of the process. Setting XDG_DATA_HOME later, in
++// SDL_main, is already too late.
++//
++// Only the literal path can be used here -- SDL_GetAndroidExternalStoragePath()
++// needs a JNI environment that does not exist yet at load time. SDL_main still
++// sets the package-private directory as a fallback, and its setenv() leaves
++// this value alone.
++__attribute__((constructor(101))) static void MkwAndroidPublishDataHome() {
++    if (::access(kAndroidPublicDataHome, R_OK | X_OK) == 0) {
++        ::setenv("XDG_DATA_HOME", kAndroidPublicDataHome, 0);
++    }
++}
++
++// A hang gives no crash report, and a single sample only says where the guest
++// happened to be, not whether it is stuck. This reports the guest's position
++// on a fixed interval, so two consecutive lines answer the question: an
++// unchanged LR with an unchanged retrace count is a spin, and a moving retrace
++// count with an unchanged LR means VI advances while the guest waits for
++// something else.
++//
++// The reads are deliberately unsynchronised. This is diagnostics: a torn
++// 32-bit value costs one misleading line, while taking the locks the guest
++// thread holds would change the timing being measured.
++void* AndroidGuestWatchdog(void*) {
++    // VIWaitForRetrace and the retrace handler both keep the count here
++    // (hle/vi.cpp:142), so reading guest memory needs no new VI interface.
++    constexpr uint32_t kViRetraceCountAddr = 0x80386be4;
++    uint32_t previousActive = 0;
++    uint32_t previousRetraces = 0;
++    bool first = true;
++    for (;;) {
++        ::sleep(2);
++        // The persistent CPU context only syncs at bridge crossings, so its
++        // lr can name an epilogue the guest left long ago. The address the
++        // runtime itself reports for translated execution -- the one the crash
++        // reports print -- does not have that problem.
++        const uint32_t active = RecompMod::CurrentTranslatedExecutionAddress();
++        const CpuContext& cpu = GetPersistentCpuContext();
++        const uint32_t lr = cpu.lr;
++        (void)cpu;
++        uint32_t retraces = 0;
++        try {
++            retraces = Memory::Read32(kViRetraceCountAddr);
++        } catch (...) {
++            retraces = 0;
++        }
++        const bool stalled = !first && active == previousActive && retraces == previousRetraces;
++        RT_LOGF(RT_TAG_RUNTIME, "watchdog: active=0x%08X lr=0x%08X retraces=%u%s\n",
++                active, lr, retraces, stalled ? "  STALLED" : "");
++        previousActive = active;
++        previousRetraces = retraces;
++        first = false;
++    }
++    return nullptr;
++}
++
++void RedirectStandardStreamsToLogcat() {
++    int fds[2];
++    if (::pipe(fds) != 0) {
++        return;
++    }
++    // Unbuffered stderr so a message that precedes a crash still reaches the
++    // pipe; line-buffered stdout is enough for the rest.
++    ::setvbuf(stdout, nullptr, _IOLBF, 0);
++    ::setvbuf(stderr, nullptr, _IONBF, 0);
++    ::dup2(fds[1], STDOUT_FILENO);
++    ::dup2(fds[1], STDERR_FILENO);
++    ::close(fds[1]);
++
++    pthread_t thread{};
++    if (::pthread_create(&thread, nullptr, AndroidLogPump,
++                         reinterpret_cast<void*>(static_cast<intptr_t>(fds[0]))) == 0) {
++        ::pthread_detach(thread);
++    } else {
++        ::close(fds[0]);
++    }
++}
++
++} // namespace
++
++extern "C" __attribute__((visibility("default")))
++int SDL_main(int argc, char** argv) {
++    RedirectStandardStreamsToLogcat();
++    {
++        pthread_t watchdog{};
++        if (::pthread_create(&watchdog, nullptr, AndroidGuestWatchdog, nullptr) == 0) {
++            ::pthread_detach(watchdog);
++        }
++    }
++    // Everywhere that is not Windows or macOS, ApplicationDataDirectory()
++    // follows the XDG spec and then falls back to the working directory. On
++    // Android none of those three answers is usable: XDG_DATA_HOME and HOME are
++    // unset, and an app process starts in "/", which it may not write. So
++    // Config.toml, the NAND image, Cache and Logs would all be attempted under
++    // "/WiiCompiled" and fail.
++    //
++    // SDL knows the directories this package actually owns. External is chosen
++    // over internal on purpose: it is the same place the ~2.6 GB DATA directory
++    // has to go, and unlike /data/data/<pkg> it can be read and written with
++    // adb push/pull without run-as. setenv() with overwrite=0 leaves an
++    // explicitly set XDG_DATA_HOME alone.
++    //
++    // A deliberately created /sdcard/MKW wins over the package's own directory.
++    // Android 11 closed /sdcard/Android/data/<pkg> to adb for writing, so with
++    // the package directory there is no way to put Config.toml or the several
++    // gigabytes of game data in place, and no way to pull a log back out. A
++    // plain public directory stays reachable from both sides. It is used only
++    // when it already exists, so nothing is created behind the user's back and
++    // a device without it falls back to private storage.
++    const char* dataHome = nullptr;
++    if (::access(kAndroidPublicDataHome, R_OK | X_OK) == 0) {
++        dataHome = kAndroidPublicDataHome;
++    } else if (const char* external = SDL_GetAndroidExternalStoragePath(); external && *external) {
++        dataHome = external;
++    } else if (const char* internal = SDL_GetAndroidInternalStoragePath(); internal && *internal) {
++        dataHome = internal;
++    }
++    if (dataHome != nullptr) {
++        ::setenv("XDG_DATA_HOME", dataHome, 0);
++    }
++    RT_LOGF(RT_TAG_RUNTIME, "Android data home: %s\n", dataHome ? dataHome : "(none)");
++    {
++        // If the configuration still comes up empty, this says which of the two
++        // possible causes it is: a path that resolves elsewhere, or a file that
++        // resolves correctly but cannot be opened.
++        const auto configPath = RuntimeConfigFile::ResolveConfigPath();
++        std::ifstream probe(configPath, std::ios::binary);
++        RT_LOGF(RT_TAG_RUNTIME, "config path: %s (openable: %s)\n",
++                RuntimeConfigFile::PathToUtf8(configPath).c_str(), probe ? "yes" : "no");
++    }
++    return RuntimeMain(argc, argv);
++}
++#endif
++
+ int main(int argc, char** argv) {
+     return RuntimeMain(argc, argv);
+ }
+--- a/runtime/src/platform/host_platform.cpp
++++ b/runtime/src/platform/host_platform.cpp
+@@ -46,6 +46,26 @@
+     std::error_code ec;
+     const auto resolved = std::filesystem::weakly_canonical(path, ec);
+     return (ec ? std::filesystem::path(path) : resolved).parent_path();
++#elif defined(__linux__)
++    // /proc/self/exe is the Linux (and therefore Android) magic symlink to the
++    // running image. readlink() neither NUL-terminates nor reports truncation,
++    // so the buffer grows until the result no longer fills it -- the same
++    // doubling the Windows branch above uses for GetModuleFileNameW, and the
++    // same code runtime_config.h's own copy of this function already had. This
++    // branch was missing here, which is why mkw_platform_paths_tests failed on
++    // the Quest with "unable to resolve the current executable directory".
++    std::string buffer(256, '\0');
++    for (;;) {
++        const ssize_t length = ::readlink("/proc/self/exe", buffer.data(), buffer.size());
++        if (length < 0) {
++            return std::nullopt;
++        }
++        if (static_cast<size_t>(length) < buffer.size()) {
++            buffer.resize(static_cast<size_t>(length));
++            return std::filesystem::path(buffer).parent_path();
++        }
++        buffer.resize(buffer.size() * 2);
++    }
+ #else
+     return std::nullopt;
+ #endif
+--- a/runtime/src/hle/audio/audio.cpp
++++ b/runtime/src/hle/audio/audio.cpp
+@@ -498,7 +498,10 @@
+     static thread_local Clock::time_point lastPoll = Clock::now();
+ 
+     const Clock::time_point now = Clock::now();
+-    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - lastPoll).count();
++    // Spelled int64_t rather than auto: microseconds::rep is long long on the
++    // Windows toolchain but long on LP64 Android, and std::min below deduces
++    // one type from both arguments.
++    int64_t elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - lastPoll).count();
+     lastPoll = now;
+ 
+     if (elapsed < 0) {
+--- a/runtime/src/hle/audio/ax_mix.cpp
++++ b/runtime/src/hle/audio/ax_mix.cpp
+@@ -32,6 +32,19 @@
+ namespace {
+ 
+ std::filesystem::path FindDspCoefficientRom() {
++#if defined(__ANDROID__)
++    // Neither path below can work in an Android app. The executable is
++    // /system/bin/app_process64 -- the zygote, not this program -- and the
++    // working directory is "/", so walking upwards from it finds nothing. The
++    // app's own data directory is where every other piece of installed state
++    // already lives (Config.toml, Cache, Logs), so look there first.
++    {
++        const auto installed = RuntimeConfigFile::ApplicationDataDirectory() / "dsp_coef.bin";
++        if (std::filesystem::is_regular_file(installed)) {
++            return installed;
++        }
++    }
++#endif
+     if (const auto executableDirectory = RuntimeConfigFile::ExecutableDirectory()) {
+         const auto adjacent = *executableDirectory / "dsp_coef.bin";
+         if (std::filesystem::is_regular_file(adjacent)) {
+--- a/runtime/include/nand_path.h
++++ b/runtime/include/nand_path.h
+@@ -57,6 +57,18 @@
+ }
+ 
+ inline std::optional<std::filesystem::path> BootstrapPayloadPath() {
++#if defined(__ANDROID__)
++    // Same reason as the DSP ROM lookup in hle/audio/ax_mix.cpp: in an Android
++    // app the executable is /system/bin/app_process64 and the working directory
++    // is "/", so neither search below can find anything. The app's own data
++    // directory holds the rest of the installed state, so it holds this too.
++    {
++        const auto installed = RuntimeConfigFile::ApplicationDataDirectory() / "wii_bootstrap";
++        if (ExistingDirectory(installed / "shared2" / "wc24")) {
++            return installed;
++        }
++    }
++#endif
+     if (auto executableDirectory = RuntimeConfigFile::ExecutableDirectory()) {
+         const auto adjacent = *executableDirectory / "wii_bootstrap";
+         if (ExistingDirectory(adjacent / "shared2" / "wc24")) {
+--- a/aurora-main/cmake/AuroraDawnProvider.cmake
++++ b/aurora-main/cmake/AuroraDawnProvider.cmake
+@@ -28,6 +28,14 @@
+     set(DAWN_ENABLE_DESKTOP_GL OFF CACHE INTERNAL "")
+     set(DAWN_ENABLE_OPENGLES OFF CACHE INTERNAL "")
+     set(DAWN_ENABLE_NULL ON CACHE INTERNAL "")
++  elseif (ANDROID)
++    set(DAWN_ENABLE_D3D12 OFF CACHE INTERNAL "")
++    set(DAWN_ENABLE_D3D11 OFF CACHE INTERNAL "")
++    set(DAWN_ENABLE_VULKAN ON CACHE INTERNAL "")
++    set(DAWN_ENABLE_METAL OFF CACHE INTERNAL "")
++    set(DAWN_ENABLE_DESKTOP_GL OFF CACHE INTERNAL "")
++    set(DAWN_ENABLE_OPENGLES ON CACHE INTERNAL "")
++    set(DAWN_ENABLE_NULL ON CACHE INTERNAL "")
+   else () # Linux / other
+     set(DAWN_ENABLE_D3D12 OFF CACHE INTERNAL "")
+     set(DAWN_ENABLE_D3D11 OFF CACHE INTERNAL "")
+@@ -39,7 +47,37 @@
+   endif ()
+ endfunction()
+ 
+-# ── Auto: resolve provider based on platform availability ──
++# The prebuilt Dawn Android package records the absolute sysroot path of
++# liblog.so from the machine that built it, which does not exist here. Replace
++# it with the plain link name. Taken from aurora upstream (749d6ee).
++function(_aurora_dawn_fix_android_link_interface)
++  if (NOT ANDROID OR NOT TARGET dawn::webgpu_dawn)
++    return()
++  endif ()
++
++  get_target_property(_dawn_link_libs dawn::webgpu_dawn INTERFACE_LINK_LIBRARIES)
++  if (NOT _dawn_link_libs)
++    return()
++  endif ()
++
++  set(_dawn_fixed_link_libs "")
++  set(_dawn_replaced_log FALSE)
++  foreach (_dawn_link_lib IN LISTS _dawn_link_libs)
++    if (_dawn_link_lib MATCHES "^/.*/sysroot/usr/lib/[^/]+/[0-9]+/liblog\.so$")
++      list(APPEND _dawn_fixed_link_libs "$<LINK_ONLY:log>")
++      set(_dawn_replaced_log TRUE)
++    else ()
++      list(APPEND _dawn_fixed_link_libs "${_dawn_link_lib}")
++    endif ()
++  endforeach ()
++
++  if (_dawn_replaced_log)
++    set_target_properties(dawn::webgpu_dawn PROPERTIES
++      INTERFACE_LINK_LIBRARIES "${_dawn_fixed_link_libs}")
++  endif ()
++endfunction()
++
++# ââ Auto: resolve provider based on platform availability ââ
+ set(_aurora_dawn_provider "${AURORA_DAWN_PROVIDER}")
+ if (_aurora_dawn_provider STREQUAL "auto")
+   # Prebuilt Dawn packages available for: windows-{amd64,arm64}, linux-{x86_64,aarch64}, darwin-{arm64,x86_64}
+@@ -50,6 +88,8 @@
+     set(_has_package TRUE)
+   elseif (APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|x86_64)$")
+     set(_has_package TRUE)
++  elseif (ANDROID AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
++    set(_has_package TRUE)
+   endif ()
+ 
+   if (_has_package)
+@@ -130,6 +170,7 @@
+     message(FATAL_ERROR "find_package(Dawn) succeeded but dawn::webgpu_dawn target not found")
+   endif ()
+   _aurora_dawn_set_platform_backends()
++  _aurora_dawn_fix_android_link_interface()
+ 
+   get_target_property(_dawn_type dawn::webgpu_dawn TYPE)
+   if (_dawn_type STREQUAL "SHARED_LIBRARY")
+@@ -155,6 +196,9 @@
+ 
+     # A release asset is mutable: the same tag has already served two different windows-amd64 archives,
+     # and a cached extraction is never re-verified. Pin the digest for the combinations we ship.
++    if (ANDROID AND _dawn_arch STREQUAL "arm64")
++      set(_dawn_arch "aarch64")
++    endif ()
+     if (NOT AURORA_DAWN_PACKAGE_URL_HASH
+         AND AURORA_DAWN_VERSION STREQUAL "v20260603.191052"
+         AND _dawn_system STREQUAL "windows" AND _dawn_arch STREQUAL "amd64")
+@@ -206,7 +250,12 @@
+   )
+     if (EXISTS "${_cmake_path}/DawnConfig.cmake")
+       set(CMAKE_FIND_PACKAGE_TARGETS_GLOBAL ON)
+-      find_package(Dawn REQUIRED CONFIG PATHS "${_cmake_path}" NO_DEFAULT_PATH)
++      # NO_CMAKE_FIND_ROOT_PATH: the Android toolchain sets
++      # CMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY, which would re-root the
++      # explicit path above into the NDK sysroot and never find the package
++      # that the EXISTS check just confirmed is there.
++      find_package(Dawn REQUIRED CONFIG PATHS "${_cmake_path}"
++        NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)
+       set(CMAKE_FIND_PACKAGE_TARGETS_GLOBAL OFF)
+       set(_dawn_cmake_found TRUE)
+       break()
+@@ -221,6 +270,7 @@
+   endif ()
+ 
+   _aurora_dawn_set_platform_backends()
++  _aurora_dawn_fix_android_link_interface()
+ 
+   get_target_property(_dawn_pkg_type dawn::webgpu_dawn TYPE)
+   if (_dawn_pkg_type STREQUAL "SHARED_LIBRARY")
+--- a/aurora-main/extern/CMakeLists.txt
++++ b/aurora-main/extern/CMakeLists.txt
+@@ -283,6 +283,17 @@
+         EXCLUDE_FROM_ALL
+       )
+       FetchContent_MakeAvailable(zstd)
++
++      # zstd's own CMake does not attach its public header directory to
++      # libzstd_static, so lib/webgpu/gpu_cache.cpp's #include <zstd.h> does not
++      # resolve. Only the shipped precompiled aurora package hid this; every
++      # from-source build needs it, Android included.
++      if (TARGET libzstd_static)
++        get_target_property(_aurora_zstd_includes libzstd_static INTERFACE_INCLUDE_DIRECTORIES)
++        if (NOT _aurora_zstd_includes)
++          target_include_directories(libzstd_static INTERFACE "${zstd_SOURCE_DIR}/lib")
++        endif ()
++      endif ()
+     else ()
+       message(STATUS "aurora: Using existing zstd")
+     endif ()

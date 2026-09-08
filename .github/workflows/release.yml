@@ -1,0 +1,36 @@
+name: Release
+
+# Pushing a tag such as v0.1.0 packs the release archive (builder, scripts, patches,
+# Android packaging files) with tools/New-ReleaseZip.ps1 and publishes a GitHub release
+# with that archive attached. Nothing is compiled here: the APK is built by every user
+# from their own disc, and no game data is involved.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pack the release archive
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'release'
+          .\tools\New-ReleaseZip.ps1 -Version $env:GITHUB_REF_NAME -OutputDirectory $out
+          "ZIP=$(Join-Path $out "MKW-Quest3-Port-$env:GITHUB_REF_NAME.zip")" >> $env:GITHUB_ENV
+
+      - name: Publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME $env:ZIP `
+            --title "MKW Quest 3 port $env:GITHUB_REF_NAME" `
+            --generate-notes
