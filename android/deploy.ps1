@@ -15,7 +15,11 @@ param(
     # Push the ~4.6 GB of game data. Off by default: it takes many minutes and
     # only has to happen once, while the APK is reinstalled on every build.
     [switch]$PushAssets,
-    [switch]$SkipInstall
+    [switch]$SkipInstall,
+    # Where the native build left the runtime's own bundled files next to the
+    # library (dsp_coef.bin, wii_bootstrap\). Empty: build-android in the work
+    # directory the APK path points into.
+    [string]$BuildDirectory = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -69,6 +73,34 @@ if ($PushAssets) {
         Write-Host "Pushing $(Split-Path -Leaf $source) (only changed files; the first time takes a while)..."
         & $Adb push --sync "$source" "$remote/"
         if ($LASTEXITCODE -ne 0) { throw "adb push failed for $source" }
+    }
+}
+
+# The runtime's own bundled files: the Wii DSP coefficient ROM and the first-run
+# NAND bootstrap. The runtime looks for them in its data directory (there is no
+# executable directory in an Android app), so they go next to Config.toml. Small,
+# and tied to the runtime version, hence pushed on every deploy, not only with
+# -PushAssets. Without them the app ends at start with "Missing bundled Wii DSP
+# coefficient ROM".
+if ([string]::IsNullOrWhiteSpace($BuildDirectory)) {
+    $BuildDirectory = Join-Path (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $Apk))) 'build-android'
+}
+foreach ($bundled in @('dsp_coef.bin', 'wii_bootstrap')) {
+    $source = Join-Path $BuildDirectory $bundled
+    if (-not (Test-Path -LiteralPath $source)) { throw "Not found: $source (build the native library first, or pass -BuildDirectory)" }
+    & $Adb push --sync "$source" "$remote/WiiCompiled/"
+    if ($LASTEXITCODE -ne 0) { throw "adb push failed for $bundled" }
+}
+# Retro Rewind's Riivolution XML lives next to RetroRewind6 (riivolution\RetroRewind6.xml);
+# the runtime reads it from the same parent on the device. Without it the pack is
+# treated as a plain disc overlay.
+if ($hasRetro) {
+    $riivolution = Join-Path (Split-Path -Parent $RetroRewindDirectory) 'riivolution'
+    if (Test-Path -LiteralPath $riivolution) {
+        & $Adb push --sync "$riivolution" "$remote/"
+        if ($LASTEXITCODE -ne 0) { throw 'adb push failed for riivolution' }
+    } else {
+        Write-Warning "No riivolution folder next to $RetroRewindDirectory; Retro Rewind will load without its XML."
     }
 }
 

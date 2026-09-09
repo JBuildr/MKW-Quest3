@@ -268,6 +268,25 @@ app, so every update means a rebuild:
 Offline modes and time trials keep working with an old pack; only online play
 needs the rebuild.
 
+> **Yellow flag for installs made with earlier versions of these scripts.**
+> If the app ends right at start with `Missing bundled Wii DSP coefficient
+> ROM (dsp_coef.bin)` in `adb logcat -s mkw`, the headset lacks three things
+> the old install step never copied: the runtime's DSP coefficient file, its
+> first-run NAND bootstrap and Retro Rewind's Riivolution XML. Either click
+> **Install on Quest** once more with the current scripts (the checkbox is
+> not needed; the step now pushes them every time), or push them by hand
+> from the work directory and the folder next to `RetroRewind6`:
+>
+> ```
+> adb push <work directory>\build-android\dsp_coef.bin /sdcard/MKW/WiiCompiled/
+> adb push <work directory>\build-android\wii_bootstrap /sdcard/MKW/WiiCompiled/
+> adb push <folder above RetroRewind6>\riivolution /sdcard/MKW/
+> ```
+>
+> Afterwards `/sdcard/MKW/WiiCompiled` holds `dsp_coef.bin` and
+> `wii_bootstrap` next to `Config.toml`, and `/sdcard/MKW/riivolution`
+> holds `RetroRewind6.xml`.
+
 ---
 
 ## Tuning: switches without rebuilding
