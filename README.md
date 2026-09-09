@@ -136,16 +136,12 @@ Nothing here helps you obtain any of that.
 | Part | Requirement |
 |---|---|
 | Windows | Windows 10/11 x64 |
-| Memory | **16 GB RAM** (the final link needs close to 15 GB; the scripts limit parallelism for that reason) |
-| Disk | about 40 GB free |
+| Memory | **8 GB RAM**. Measured on a full build: one compile peaks at about 0.5 GB, four running in parallel at 1.5 GB, the final link at under 1 GB. The scripts pick the number of parallel compiles from the free memory (one per GB, at most one per core) |
+| Disk | about 10 GB free: the work directory (WiiCompiled clone, extracted disc, translated code, native build) measured 4.4 GB, Retro Rewind 2 GB plus its 1.8 GB download |
+| CPU | any 64-bit x86. Measured on a Ryzen 7 5700U (8 cores, laptop): the whole first build from clone to APK took 19 minutes, the native build inside it 14 to 15 minutes; a rebuild after a code change about 30 seconds. Fewer cores or a slower disk stretch the native build accordingly |
 | Android SDK | **NDK 28.x**, **build-tools 35.0.0**, **platform android-34**, the **CMake** package (brings CMake and Ninja) and `platform-tools` (adb). Android Studio's SDK Manager installs all of them |
 | Tools | a JDK 17 or newer (`javac`), Git for Windows, .NET SDK 8 or newer |
 | Headset | a Quest 3 in developer mode, connected over USB with USB debugging allowed |
-
-> **Under construction.** Work is in progress to make the build faster and
-> to get it running on lower-spec hardware (less memory for the final link,
-> fewer parallel jobs on smaller machines). Until then, the numbers above are
-> what the build was verified with.
 
 ---
 
@@ -185,9 +181,9 @@ Nothing here helps you obtain any of that.
    It downloads Retro Rewind (about 1.8 GB) into `RetroRewind6` next to the
    work directory, fills in the field, and the line *Retro Rewind up to date*
    turns green.
-7. **Click "Build APK".** First time: an hour or more (clone and patch
+7. **Click "Build APK".** First time: about 20 minutes (clone and patch
    WiiCompiled, build the translator, validate and extract your disc,
-   translate the game, native build, package). The log ends with
+   translate the game, native build of about 15 minutes, package). The log ends with
    `APK: <work directory>\android\out\mkw-quest.apk`. Every step is skipped
    when its result already exists, so a failed run continues where it
    stopped: fix the cause and click again.
@@ -199,6 +195,9 @@ Nothing here helps you obtain any of that.
    **"Install on Quest"**. The first push copies several GB of game data to
    `/sdcard/MKW`; later installs without the tick only replace the app.
 9. **Start the app** from the headset's app library under *Unknown sources*.
+   Every start begins with the shader compilation: the screen stays on the
+   loading picture for up to a minute before the game appears. That is
+   normal, wait it out.
 
 > **Item box.** Updates later are short: **Get / update Retro Rewind**, then
 > **Build APK** (minutes), then **Install on Quest** without the tick.

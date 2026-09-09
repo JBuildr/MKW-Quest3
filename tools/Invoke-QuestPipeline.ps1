@@ -14,7 +14,8 @@ param(
     [string]$BuildWorkspace = "$env:APPDATA\CT-MKWII\Recomp\Install\BuildWorkspace",
     [string]$Toolkit = "$env:APPDATA\CT-MKWII\Recomp\Install\Toolkit",
     [string]$Sdk = "$env:LOCALAPPDATA\Android\Sdk",
-    [int]$Jobs = 4,
+    # Parallel compiles for the native build; 0 = from free memory (Build-Quest.ps1).
+    [int]$Jobs = 0,
     [switch]$Install,
     [switch]$PushAssets,
     # Skip the build and only install what <Workspace>\android\out already holds.

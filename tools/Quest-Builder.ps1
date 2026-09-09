@@ -91,7 +91,7 @@ function Get-Requirements([hashtable]$Values) {
         & $add $tool[1] ([bool]$cmd) $(if ($cmd) { $cmd.Source } else { 'not on PATH' }) $true
     }
     $memoryGB = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
-    & $add 'RAM (16 GB needed for the final link)' ($memoryGB -ge 15) "$memoryGB GB" $false
+    & $add 'RAM (8 GB; the build picks its parallelism from the free memory)' ($memoryGB -ge 7) "$memoryGB GB" $false
     return $items
 }
 
@@ -243,7 +243,7 @@ function Start-Pipeline([string[]]$ExtraArguments, [string]$What) {
     if ($fields.DiscImage.Text) { $arguments += @('-DiscImage', ('"' + $fields.DiscImage.Text + '"')) }
     if ($fields.RetroRewind.Text) { $arguments += @('-RetroRewindDirectory', ('"' + $fields.RetroRewind.Text + '"')) }
     if ($fields.BuildWorkspace.Text) { $arguments += @('-BuildWorkspace', ('"' + $fields.BuildWorkspace.Text + '"')) }
-    Start-Script $pipeline ($arguments + $ExtraArguments) "$What... (a first build takes an hour or more)"
+    Start-Script $pipeline ($arguments + $ExtraArguments) "$What... (a first build takes about 20 minutes)"
 }
 
 $retroButton.Add_Click({

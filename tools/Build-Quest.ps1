@@ -9,9 +9,9 @@ param(
     # CMake and Ninja: the WiiCompiled toolkit ships both; the SDK's own CMake
     # or a system install works as well.
     [string]$Toolkit = "$env:APPDATA\CT-MKWII\Recomp\Install\Toolkit",
-    # The final link needs close to 15 GB; more parallel compiles on a 16 GB
-    # machine get the build killed by the system. Raise on bigger machines.
-    [int]$Jobs = 4,
+    # Parallel compiles. 0 picks the number from the free memory at start (one
+    # job per GB, at most one per physical core); an explicit number pins it.
+    [int]$Jobs = 0,
     # RetroRewind (needs the translated mod) or WiiCompiled (the base game).
     [ValidateSet('RetroRewind', 'WiiCompiled')] [string]$Product = 'RetroRewind',
     [switch]$SkipConfigure,
@@ -61,6 +61,18 @@ if (-not $SkipConfigure) {
     if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed' }
 }
 
+if ($Jobs -le 0) {
+    # Measured on a full build: one compile peaks at about 0.5 GB of working set
+    # (translated shards and runtime alike, built without debug info) and the
+    # final link at under 1 GB, so what has to fit into memory is the number of
+    # compiles running at once. One job per GB of free memory, at least one, at
+    # most one per physical core.
+    $freeGB = (Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1MB
+    $cores = (Get-CimInstance Win32_Processor | Measure-Object -Property NumberOfCores -Sum).Sum
+    if (-not $cores) { $cores = [Environment]::ProcessorCount }
+    $Jobs = [math]::Max(1, [math]::Min($cores, [math]::Floor($freeGB / 1.0)))
+    Write-Host ("Free memory {0:N1} GB, {1} cores: {2} parallel jobs" -f $freeGB, $cores, $Jobs)
+}
 Write-Host "Building lib$Product.so with $Jobs parallel jobs (this takes long)..."
 & $ninja -C $buildDir -j $Jobs $Product
 if ($LASTEXITCODE -ne 0) { throw 'Build failed' }

@@ -26,7 +26,11 @@ foreach ($tool in @('git', 'dotnet')) {
 }
 
 if (-not (Test-Path -LiteralPath (Join-Path $Workspace '.git'))) {
-    if (Test-Path -LiteralPath $Workspace) { throw "$Workspace exists but is not a git clone." }
+    # An existing but empty directory is fine (the builder's folder dialog and users
+    # create one first); git clone accepts it. Anything else in it is refused.
+    if ((Test-Path -LiteralPath $Workspace) -and (Get-ChildItem -LiteralPath $Workspace -Force | Select-Object -First 1)) {
+        throw "$Workspace exists and is not empty, but is not a git clone."
+    }
     Write-Host "Cloning $Repository ..."
     & git clone --quiet $Repository $Workspace
     if ($LASTEXITCODE -ne 0) { throw 'git clone failed' }
@@ -68,10 +72,21 @@ foreach ($patch in $patchOrder) {
         # repository moved on since the work copy was made). The work copy is a git clone, so
         # the files the patch touches go back to the pinned commit, Fix AA is redone where it
         # belongs, and the current patch goes on top.
-        $files = @([IO.File]::ReadAllLines($path) | Where-Object { $_ -like '--- a/*' } | ForEach-Object { $_.Substring(6) } | Select-Object -Unique)
+        $lines = [IO.File]::ReadAllLines($path)
+        $files = @($lines | Where-Object { $_ -like '--- a/*' } | ForEach-Object { $_.Substring(6) } | Select-Object -Unique)
+        # Files the patch creates (a "--- /dev/null" header) are not in the pinned commit;
+        # an older copy left by the previous version of the patch would make git apply
+        # refuse to create them, so they are removed before the patch goes back on.
+        $created = @(for ($i = 0; $i -lt $lines.Count - 1; $i++) {
+            if ($lines[$i] -eq '--- /dev/null' -and $lines[$i + 1] -like '+++ b/*') { $lines[$i + 1].Substring(6) }
+        })
         Write-Host "$patch changed since it was applied here; resetting $($files.Count) file(s) to $Commit and re-applying."
         & git -C $Workspace checkout --quiet $Commit -- $files
         if ($LASTEXITCODE -ne 0) { throw "git checkout of the files of $patch failed" }
+        foreach ($file in $created) {
+            $full = Join-Path $Workspace $file
+            if (Test-Path -LiteralPath $full) { Remove-Item -LiteralPath $full -Force }
+        }
         # The reset also dropped what the earlier patches did to these files (0001 and 0003
         # both touch runtime/src/main.cpp): put their hunks for exactly these files back,
         # in patch order, before Fix AA and the current patch.

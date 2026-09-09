@@ -4,7 +4,7 @@ param(
     [string]$Package = 'org.mkwpc.quest',
     # The APK lives in the work directory, never in the repository (Fix AD); the pipeline
     # passes the path, and the default is the builder's default work directory.
-    [string]$Apk = "$env:LOCALAPPDATA\mkw-quest\workspacendroid\out\mkw-quest.apk",
+    [string]$Apk = "$env:LOCALAPPDATA\mkw-quest\workspace\android\out\mkw-quest.apk",
     # The DATA directory the installer already extracted from the user's own
     # disc image. Read from here, never written to, never copied into the repo.
     [string]$DataDirectory = "$env:APPDATA\CT-MKWII\Recomp\Install\GameAssets\DATA",
