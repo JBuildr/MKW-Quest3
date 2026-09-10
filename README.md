@@ -18,6 +18,8 @@
   Retro Rewind supported. No game data in this repository, ever.
 </p>
 
+<h1>FULL VR MODE Will release 09.12.2026</h1>
+
 <p align="center">
   <img alt="Platform: Meta Quest 3" src="https://img.shields.io/badge/platform-Meta%20Quest%203-1a73e8">
   <img alt="Built from your own disc" src="https://img.shields.io/badge/game%20data-bring%20your%20own%20disc-e53935">
