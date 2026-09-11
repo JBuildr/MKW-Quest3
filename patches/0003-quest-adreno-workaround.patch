@@ -598,7 +598,7 @@
    const auto label = fmt::format("GX Shader {:x}", hash);
 --- a/aurora-main/lib/gx/shader_info.hpp
 +++ b/aurora-main/lib/gx/shader_info.hpp
-@@ -10,6 +10,31 @@
+@@ -10,6 +10,33 @@
    std::array<gfx::Range, MaxInterpolatedFrames> interpolated;
  };
  
@@ -610,6 +610,8 @@
 +constexpr u32 GxDebugDisableDrawMerge = 4u;     // every GX draw command becomes its own draw call
 +constexpr u32 GxDebugDeindex16 = 1024u;         // force CPU de-indexing on (see gx_deindex_enabled)
 +constexpr u32 GxDebugComputeRepro = 2048u;      // gfx: compute-shader replay of one GX_INDEX16 position fetch per 180 frames
++constexpr u32 GxDebugDeindexStats = 8192u;      // command_processor: per-frame cost of the CPU de-indexing, one log line per second
++constexpr u32 GxDebugDeindexStatsHash = 16384u; // with 8192: also hash every expanded draw for the repeat-rate columns (costs ~0.6 us per draw)
 +u32 gx_debug_flags() noexcept;
 +
 +// Adreno-740 workaround: every indexed draw is expanded on the CPU into a
@@ -640,7 +642,7 @@
  #include <cstring>
  #if !defined(_LIBCPP_VERSION)
  #include <execution>
-@@ -292,6 +293,42 @@
+@@ -292,6 +293,43 @@
  }
  } // namespace
  
@@ -673,7 +675,8 @@
 +    }
 +    const auto parsed = static_cast<u32>(std::strtoul(value, nullptr, 10));
 +    Log.warn("AURORA_GX_DEBUG={} (1=ignore per-vertex pn matrix index, 2=compact matrix layout, 4=no draw merge, "
-+             "1024=force CPU de-indexing, 2048=compute replay of the u16 index fetch)",
++             "1024=force CPU de-indexing, 2048=compute replay of the u16 index fetch, "
++             "8192=per-frame de-indexing statistics, 16384=with repeat-rate hashing)",
 +             parsed);
 +    return parsed;
 +  }();
@@ -683,7 +686,7 @@
  ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
    ZoneScoped;
  
-@@ -305,10 +342,14 @@
+@@ -305,10 +343,14 @@
      info.lineMode = config.lineMode;
    }
  
@@ -699,7 +702,7 @@
      } else if (attrType == GX_INDEX8 || attrType == GX_INDEX16) {
        info.indexAttr.set(attr);
      }
-@@ -423,7 +464,7 @@
+@@ -423,7 +465,7 @@
      auto& layout = info.matrixLayout;
      layout.postexRemap.fill(UniformMatrixLayout::kAbsent);
  
@@ -710,7 +713,62 @@
      for (size_t i = 0; i < info.sampledTexCoords.size(); ++i) {
 --- a/aurora-main/lib/gx/command_processor.cpp
 +++ b/aurora-main/lib/gx/command_processor.cpp
-@@ -2080,6 +2080,257 @@
+@@ -9,6 +9,7 @@
+ #include "pipeline.hpp"
+ #include "shader_info.hpp"
+ #include "../internal.hpp"
++#include "fifo.hpp" // deindex_stats: tells FIFO draws (drain buffer) from display-list draws (guest memory)
+ 
+ #include <absl/container/flat_hash_map.h>
+ #include <tracy/Tracy.hpp>
+@@ -466,10 +467,36 @@
+ static bool handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndian);
+ static bool handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian);
+ 
++// Quest-3 diagnostics (AURORA_GX_DEBUG bit 8192): defined next to the de-indexing workaround
++// below; this timer only attributes the wall time of one process() call to the frame's tally.
++static bool deindex_stats_enabled() noexcept;
++static void deindex_stats_add_process_nanos(u64 nanos) noexcept;
++static void deindex_stats_note_inval_vtx() noexcept;
++struct DeindexStatsProcessTimer {
++  std::chrono::steady_clock::time_point start{};
++  bool active = false;
++  DeindexStatsProcessTimer() noexcept {
++    if (deindex_stats_enabled()) UNLIKELY {
++      active = true;
++      start = std::chrono::steady_clock::now();
++    }
++  }
++  ~DeindexStatsProcessTimer() {
++    if (active) {
++      deindex_stats_add_process_nanos(static_cast<u64>(
++          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
++    }
++  }
++  DeindexStatsProcessTimer(const DeindexStatsProcessTimer&) = delete;
++  DeindexStatsProcessTimer& operator=(const DeindexStatsProcessTimer&) = delete;
++};
++
+ void process(const u8* data, u32 size, bool bigEndian) {
+   ZoneScoped;
+   // Everything decoded here mutates renderer state (GX state, the recorded command lists and the mapped staging buffers), so take the renderer GPU mutex once for the whole drain rather than once per draw command.
+   std::lock_guard gpuLock(aurora::renderer_gpu_mutex());
++  // AURORA_GX_DEBUG bit 8192: time the whole decode of this list (deindex_stats, below).
++  const DeindexStatsProcessTimer processTimer;
+   u32 pos = 0;
+ 
+   while (pos < size) {
+@@ -548,6 +575,9 @@
+ 
+     case CP_CMD_INVAL_VTX: {
+       // GXInvalidateVtxCache tells the GPU that CPU-written indexed vertex arrays must be observed by subsequent draws.
++      if (deindex_stats_enabled()) UNLIKELY {
++        deindex_stats_note_inval_vtx();
++      }
+       for (int i = GX_VA_POS; i <= GX_VA_TEX7; ++i) {
+         g_gxState.arrays[i].cachedRange = {};
+       }
+@@ -2080,6 +2110,554 @@
    return state;
  }
  
@@ -848,7 +906,6 @@
 +  static u32 seenCount = 0;
 +  const auto& vtxFmt = g_gxState.vtxFmts[fmt];
 +  u64 key = static_cast<u64>(fmt) | (static_cast<u64>(plan.srcStride) << 8) | (static_cast<u64>(plan.dstStride) << 16);
-+  std::string desc;
 +  for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
 +    const auto attrType = g_gxState.vtxDesc[i];
 +    if (attrType == GX_NONE) {
@@ -858,19 +915,33 @@
 +    key = key * 1099511628211ull ^ (static_cast<u64>(i) | (static_cast<u64>(attrType) << 8) |
 +                                    (static_cast<u64>(attr.type) << 16) | (static_cast<u64>(attr.cnt) << 24) |
 +                                    (static_cast<u64>(attr.frac) << 32));
-+    const char* how = attrType == GX_DIRECT ? "D" : attrType == GX_INDEX8 ? "I8" : "I16";
-+    if (i >= GX_VA_POS) {
-+      desc += fmt::format(" {}:{}(t{}c{}f{})", i, how, static_cast<int>(attr.type), static_cast<int>(attr.cnt),
-+                          static_cast<int>(attr.frac));
-+    } else {
-+      desc += fmt::format(" {}:{}", i, how);
-+    }
 +  }
++  // The description is only built when a line is actually logged: this runs once per expanded
++  // draw (15 000 per frame in a race), and formatting it every time cost more than the expansion.
++  const auto describe = [&] {
++    std::string desc;
++    for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
++      const auto attrType = g_gxState.vtxDesc[i];
++      if (attrType == GX_NONE) {
++        continue;
++      }
++      const auto& attr = vtxFmt.attrs[i];
++      const char* how = attrType == GX_DIRECT ? "D" : attrType == GX_INDEX8 ? "I8" : "I16";
++      if (i >= GX_VA_POS) {
++        desc += fmt::format(" {}:{}(t{}c{}f{})", i, how, static_cast<int>(attr.type), static_cast<int>(attr.cnt),
++                            static_cast<int>(attr.frac));
++      } else {
++        desc += fmt::format(" {}:{}", i, how);
++      }
++    }
++    return desc;
++  };
 +  for (u32 k = 0; k < seenCount; ++k) {
 +    if (seen[k] == key) {
 +      if (outOfRange != 0 && !seenOutOfRange[k]) {
 +        seenOutOfRange[k] = true;
-+        Log.warn("deindex: {} indices beyond their array in format vat={}{}", outOfRange, static_cast<int>(fmt), desc);
++        Log.warn("deindex: {} indices beyond their array in format vat={}{}", outOfRange, static_cast<int>(fmt),
++                 describe());
 +      }
 +      return;
 +    }
@@ -882,8 +953,289 @@
 +  seenOutOfRange[seenCount] = outOfRange != 0;
 +  ++seenCount;
 +  Log.info("deindex: format vat={} stride {} -> {} (t0=u8 1=s8 2=u16 3=s16 4=f32):{}{}", static_cast<int>(fmt),
-+           plan.srcStride, plan.dstStride, desc, outOfRange != 0 ? fmt::format(" [{} indices beyond array]", outOfRange) : "");
++           plan.srcStride, plan.dstStride, describe(),
++           outOfRange != 0 ? fmt::format(" [{} indices beyond array]", outOfRange) : "");
 +}
++
++// Quest-3 diagnostics (AURORA_GX_DEBUG bit 8192, GxDebugDeindexStats): what the expansion above
++// costs per frame and how much of it repeats. Measurement only, the expansion is untouched; the
++// probe sits around deindex_vertices. Every draw that enters DeindexedDraw is counted, every
++// expanded draw is timed and hashed (source stream and expanded output) and looked up under two
++// keys: the pointer key (source pointer, count, format, plan and array bases: what a cache could
++// key on for display-list draws, whose source is guest memory) and the content key (the same
++// without the pointer, plus the hash of the source bytes: what FIFO draws need, whose source is
++// the drain buffer that is rewritten every drain). Per frame the tally says how many expanded
++// draws had their pointer key seen before (previous frame or earlier in this frame), the same
++// source bytes under it, the same expanded bytes under it, and the same expanded bytes under
++// the content key (the draws a cache could have served either way). One log line per second
++// with per-frame averages; fifo::process() is timed as a whole for comparison, and the probe's
++// own hashing time is reported separately.
++namespace deindex_stats {
++using Clock = std::chrono::steady_clock;
++struct Entry {
++  u64 srcHash = 0;
++  u64 outHash = 0;
++};
++struct Frame {
++  u32 draws = 0;    // draws through DeindexedDraw (expanded or not)
++  u32 expanded = 0; // draws the expansion actually rewrote
++  u32 fromFifo = 0; // expanded draws whose source is the FIFO drain buffer (the rest: display lists)
++  u64 srcBytes = 0;
++  u64 dstBytes = 0;
++  u64 expandNanos = 0; // deindex_vertices only
++  u32 keyHits = 0;
++  u32 srcHits = 0;
++  u32 outHits = 0;
++  u64 outHitBytes = 0;
++  u32 contentHits = 0;
++  u64 contentHitBytes = 0;
++  u32 contentHitsIntraFrame = 0; // of contentHits: key first seen earlier in the same frame, not last frame
++  u32 invalVtx = 0;     // CP_CMD_INVAL_VTX (GXInvalidateVtxCache) seen this frame
++  u32 arrays = 0;       // distinct vertex arrays the expanded draws read
++  u64 arrayBytes = 0;   // their sizes summed (what a content check of the arrays would hash)
++  u64 probeNanos = 0;   // hashing and lookup, the cost of measuring
++  u64 processNanos = 0; // fifo::process() wall time
++  u32 gpuDraws = 0;     // gfx::g_drawCallCount as last seen in this frame (draw commands recorded for the GPU)
++  u32 mergedDraws = 0;  // gfx::g_mergedDrawCallCount likewise (GX draws folded into the previous draw command)
++  u64 periodNanos = 0;  // wall time from this frame's first event to the next frame's first event
++  void add(const Frame& o) noexcept {
++    draws += o.draws;
++    expanded += o.expanded;
++    fromFifo += o.fromFifo;
++    srcBytes += o.srcBytes;
++    dstBytes += o.dstBytes;
++    expandNanos += o.expandNanos;
++    keyHits += o.keyHits;
++    srcHits += o.srcHits;
++    outHits += o.outHits;
++    outHitBytes += o.outHitBytes;
++    contentHits += o.contentHits;
++    contentHitBytes += o.contentHitBytes;
++    contentHitsIntraFrame += o.contentHitsIntraFrame;
++    invalVtx += o.invalVtx;
++    arrays += o.arrays;
++    arrayBytes += o.arrayBytes;
++    probeNanos += o.probeNanos;
++    processNanos += o.processNanos;
++    gpuDraws += o.gpuDraws;
++    mergedDraws += o.mergedDraws;
++    periodNanos += o.periodNanos;
++  }
++};
++struct State {
++  u32 frame = UINT32_MAX;
++  Frame cur{};
++  Frame sum{};
++  u32 frames = 0;
++  u64 maxExpandNanos = 0;
++  u64 maxProcessNanos = 0;
++  u64 maxPeriodNanos = 0;
++  Clock::time_point frameStart{};
++  absl::flat_hash_map<u64, Entry> prev;
++  absl::flat_hash_map<u64, Entry> now;
++  absl::flat_hash_map<u64, u64> prevByContent; // content key -> output hash
++  absl::flat_hash_map<u64, u64> nowByContent;
++  absl::flat_hash_map<uintptr_t, u32> arraysSeen; // this frame's distinct array pointers
++  Clock::time_point lastLog{};
++  bool everLogged = false;
++};
++static State& state() noexcept {
++  static State s;
++  return s;
++}
++static inline u64 nanos_since(Clock::time_point t) noexcept {
++  return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t).count());
++}
++static inline double ms(u64 nanos, u32 frames) noexcept {
++  return frames == 0 ? 0.0 : static_cast<double>(nanos) / 1.0e6 / static_cast<double>(frames);
++}
++static inline double kb(u64 bytes, u32 frames) noexcept {
++  return frames == 0 ? 0.0 : static_cast<double>(bytes) / 1024.0 / static_cast<double>(frames);
++}
++static inline double pct(u32 part, u32 whole) noexcept {
++  return whole == 0 ? 0.0 : 100.0 * static_cast<double>(part) / static_cast<double>(whole);
++}
++// Called under the renderer GPU mutex (process, submit_raw_draw). Folds the finished frame into
++// the running sums when the frame index moves on, and logs once a second.
++static void frame_tick() noexcept {
++  State& s = state();
++  const u32 frame = gfx::current_frame();
++  if (frame == s.frame) {
++    // Same frame: only keep the draw-command counters current (they are reset by begin_frame).
++    s.cur.gpuDraws = gfx::g_drawCallCount;
++    s.cur.mergedDraws = gfx::g_mergedDrawCallCount;
++    return;
++  }
++  const auto t = Clock::now();
++  if (s.frame != UINT32_MAX) {
++    s.cur.periodNanos = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(t - s.frameStart).count());
++    s.sum.add(s.cur);
++    ++s.frames;
++    s.maxExpandNanos = std::max(s.maxExpandNanos, s.cur.expandNanos);
++    s.maxProcessNanos = std::max(s.maxProcessNanos, s.cur.processNanos);
++    s.maxPeriodNanos = std::max(s.maxPeriodNanos, s.cur.periodNanos);
++  }
++  s.cur = Frame{};
++  s.frame = frame;
++  s.frameStart = t;
++  std::swap(s.prev, s.now);
++  s.now.clear();
++  std::swap(s.prevByContent, s.nowByContent);
++  s.nowByContent.clear();
++  s.arraysSeen.clear();
++  if (!s.everLogged) {
++    s.everLogged = true;
++    s.lastLog = t;
++    return;
++  }
++  if (t - s.lastLog < std::chrono::seconds(1) || s.frames == 0) {
++    return;
++  }
++  const Frame& f = s.sum;
++  const u32 n = s.frames;
++  Log.info("deindex stats: {} frames, period {:.1f} ms (max {:.1f}), gpu draws {:.0f} (+{:.0f} merged); per frame: "
++           "draws {:.0f}, expanded {:.0f} ({:.0f} from fifo), {:.0f} -> {:.0f} KB, "
++           "expand {:.2f} ms (max {:.2f}); of expanded: ptr key hit {:.0f}%, same source {:.0f}%, same output {:.0f}% "
++           "({:.0f} KB), content key same output {:.0f}% ({:.0f} KB, {:.0f}% of them within the frame); arrays {:.0f} "
++           "({:.0f} KB), inval_vtx {:.1f}; fifo::process {:.2f} ms (max {:.2f}, includes probe overhead {:.2f} ms)",
++           n, ms(f.periodNanos, n), ms(s.maxPeriodNanos, 1), static_cast<double>(f.gpuDraws) / n,
++           static_cast<double>(f.mergedDraws) / n, static_cast<double>(f.draws) / n,
++           static_cast<double>(f.expanded) / n,
++           static_cast<double>(f.fromFifo) / n, kb(f.srcBytes, n), kb(f.dstBytes, n), ms(f.expandNanos, n),
++           ms(s.maxExpandNanos, 1), pct(f.keyHits, f.expanded), pct(f.srcHits, f.expanded), pct(f.outHits, f.expanded),
++           kb(f.outHitBytes, n), pct(f.contentHits, f.expanded), kb(f.contentHitBytes, n),
++           pct(f.contentHitsIntraFrame, f.contentHits), static_cast<double>(f.arrays) / n, kb(f.arrayBytes, n),
++           static_cast<double>(f.invalVtx) / n, ms(f.processNanos, n), ms(s.maxProcessNanos, 1), ms(f.probeNanos, n));
++  s.sum = Frame{};
++  s.frames = 0;
++  s.maxExpandNanos = 0;
++  s.maxProcessNanos = 0;
++  s.maxPeriodNanos = 0;
++  s.lastLog = t;
++}
++} // namespace deindex_stats
++
++static bool deindex_stats_enabled() noexcept {
++  static const bool enabled = (gx_debug_flags() & GxDebugDeindexStats) != 0;
++  return enabled;
++}
++static void deindex_stats_add_process_nanos(u64 nanos) noexcept {
++  deindex_stats::frame_tick();
++  deindex_stats::state().cur.processNanos += nanos;
++}
++static void deindex_stats_note_inval_vtx() noexcept {
++  deindex_stats::frame_tick();
++  ++deindex_stats::state().cur.invalVtx;
++}
++
++// One per draw in DeindexedDraw; does nothing unless bit 8192 is set.
++struct DeindexStatsProbe {
++  bool active = false;
++  deindex_stats::Clock::time_point t0{};
++  DeindexStatsProbe() noexcept {
++    if (deindex_stats_enabled()) UNLIKELY {
++      active = true;
++      deindex_stats::frame_tick();
++      ++deindex_stats::state().cur.draws;
++    }
++  }
++  void expand_begin() noexcept {
++    if (active) UNLIKELY {
++      t0 = deindex_stats::Clock::now();
++    }
++  }
++  void expand_end(GXVtxFmt fmt, const DeindexPlan& plan, const u8* src, u16 vtxCount, const u8* dst,
++                  size_t dstBytes) noexcept {
++    if (!active) LIKELY {
++      return;
++    }
++    const u64 expandNanos = deindex_stats::nanos_since(t0);
++    const auto probeStart = deindex_stats::Clock::now();
++    auto& s = deindex_stats::state();
++    auto& f = s.cur;
++    ++f.expanded;
++    const size_t srcBytes = static_cast<size_t>(vtxCount) * plan.srcStride;
++    f.srcBytes += srcBytes;
++    f.dstBytes += dstBytes;
++    f.expandNanos += expandNanos;
++    // The repeat-rate columns need two hashes and two lookups per draw (about 9 ms per frame at
++    // 14 000 draws); only with bit 16384, so that the timing columns can be compared between
++    // runs that differ in nothing but aurora_deindex.
++    static const bool hashing = (gx_debug_flags() & GxDebugDeindexStatsHash) != 0;
++    if (!hashing) {
++      f.probeNanos += deindex_stats::nanos_since(probeStart);
++      return;
++    }
++    const auto srcAddr = reinterpret_cast<uintptr_t>(src);
++    const auto fifoAddr = reinterpret_cast<uintptr_t>(detail::sBufferData);
++    if (detail::sBufferData != nullptr && srcAddr >= fifoAddr && srcAddr < fifoAddr + detail::sBufferCapacity) {
++      ++f.fromFifo;
++    }
++    // Everything the expansion's result depends on except the bytes themselves: format, plan
++    // (VCD/VAT), array bases, strides and sizes.
++    Hasher layoutHasher;
++    layoutHasher.update(vtxCount);
++    layoutHasher.update(static_cast<u32>(fmt));
++    layoutHasher.update(plan.srcStride);
++    layoutHasher.update(plan.dstStride);
++    for (u32 n = 0; n < plan.count; ++n) {
++      const auto& a = plan.attrs[n];
++      const u32 layout = static_cast<u32>(a.srcOffset) | (static_cast<u32>(a.dstOffset) << 8) |
++                         (static_cast<u32>(a.bytes) << 16) | (static_cast<u32>(a.indexSize) << 24);
++      layoutHasher.update(layout);
++      layoutHasher.update(static_cast<u32>(a.indexCount) | (static_cast<u32>(a.arrayStride) << 8));
++      layoutHasher.update(reinterpret_cast<uintptr_t>(a.array));
++      layoutHasher.update(a.arraySize);
++      if (a.indexSize != 0 && s.arraysSeen.try_emplace(reinterpret_cast<uintptr_t>(a.array), 1u).second) {
++        ++f.arrays;
++        f.arrayBytes += a.arraySize;
++      }
++    }
++    const u64 layoutHash = layoutHasher.digest();
++    const deindex_stats::Entry entry{
++        .srcHash = xxh3_hash_s(src, srcBytes),
++        .outHash = xxh3_hash_s(dst, dstBytes),
++    };
++    const u64 key = hash_combine(layoutHash, static_cast<u64>(reinterpret_cast<uintptr_t>(src)));
++    const u64 contentKey = hash_combine(layoutHash, entry.srcHash);
++    const deindex_stats::Entry* seen = nullptr;
++    if (auto it = s.prev.find(key); it != s.prev.end()) {
++      seen = &it->second;
++    } else if (auto jt = s.now.find(key); jt != s.now.end()) {
++      seen = &jt->second;
++    }
++    if (seen != nullptr) {
++      ++f.keyHits;
++      if (seen->srcHash == entry.srcHash) {
++        ++f.srcHits;
++      }
++      if (seen->outHash == entry.outHash) {
++        ++f.outHits;
++        f.outHitBytes += dstBytes;
++      }
++    }
++    const u64* seenOut = nullptr;
++    bool seenThisFrameOnly = false;
++    if (auto it = s.prevByContent.find(contentKey); it != s.prevByContent.end()) {
++      seenOut = &it->second;
++    } else if (auto jt = s.nowByContent.find(contentKey); jt != s.nowByContent.end()) {
++      seenOut = &jt->second;
++      seenThisFrameOnly = true;
++    }
++    if (seenOut != nullptr && *seenOut == entry.outHash) {
++      ++f.contentHits;
++      f.contentHitBytes += dstBytes;
++      if (seenThisFrameOnly) {
++        ++f.contentHitsIntraFrame; // e.g. one kart mesh drawn for several karts in one frame
++      }
++    }
++    s.now.insert_or_assign(key, entry);
++    s.nowByContent.insert_or_assign(contentKey, entry.outHash);
++    f.probeNanos += deindex_stats::nanos_since(probeStart);
++  }
++  DeindexStatsProbe(const DeindexStatsProbe&) = delete;
++  DeindexStatsProbe& operator=(const DeindexStatsProbe&) = delete;
++};
 +
 +// Vertex descriptor override for a de-indexed draw: populate_pipeline_config, the storage
 +// range loop in handle_draw_unmerged and the geometry signature all read g_gxState.vtxDesc,
@@ -899,6 +1251,7 @@
 +
 +  DeindexedDraw(GXVtxFmt fmt, const u8* srcVertices, u16 vtxCount, u32 srcVtxSize) noexcept
 +      : vertices(srcVertices), vtxSize(srcVtxSize) {
++    DeindexStatsProbe probe; // bit 8192 only: counts this draw, times the expansion below
 +    if (!gx_deindex_enabled()) {
 +      return;
 +    }
@@ -942,7 +1295,9 @@
 +    if (buffer.size() < bytes) {
 +      buffer.resize(bytes);
 +    }
++    probe.expand_begin();
 +    const u32 outOfRange = deindex_vertices(plan, srcVertices, vtxCount, buffer.data());
++    probe.expand_end(fmt, plan, srcVertices, vtxCount, buffer.data(), bytes);
 +    log_deindex_plan(fmt, plan, outOfRange);
 +    savedDesc = g_gxState.vtxDesc;
 +    for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
@@ -968,7 +1323,7 @@
  bool submit_raw_draw(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, uint16_t vtxCount,
                       uint32_t vertexBytes) {
    ZoneScoped;
-@@ -2114,18 +2365,93 @@
+@@ -2114,18 +2692,93 @@
  
    // This entry point bypasses process(), so it owns the renderer lock itself.
    std::lock_guard gpuLock(aurora::renderer_gpu_mutex());
@@ -1065,7 +1420,7 @@
  static bool handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndian) {
    ZoneScoped;
    GXVtxFmt fmt = static_cast<GXVtxFmt>(cmd & CP_VAT_MASK);
-@@ -2152,16 +2478,29 @@
+@@ -2152,16 +2805,29 @@
  
  
    // Push raw vertex data to buffer
@@ -1102,7 +1457,7 @@
        const auto& indexTemplate = cached_index_template(prim, vtxCount);
        const auto indices = offset_index_template(indexTemplate, lastDraw->vtxCount);
        const u32 numIndices = indexTemplate.indexCount;
-@@ -2193,6 +2532,11 @@
+@@ -2193,6 +2859,11 @@
                         matrixUsage.mask, matrixUsage.topologySignature,
                         interpolationIdentityActive ? draw_geometry_signature(fmt, vertices, vtxCount, vtxSize) : 0,
                         interpolationIdentityActive);
@@ -1994,3 +2349,132 @@
      constexpr size_t kHostStackSize = 1024 * 1024;
      gf.fiber = HostContext::Create(kHostStackSize, FiberProc,
                                     reinterpret_cast<void*>(static_cast<uintptr_t>(guestThreadAddr)));
+--- a/runtime/src/hle/gx/gx_dl.cpp
++++ b/runtime/src/hle/gx/gx_dl.cpp
+@@ -2,7 +2,10 @@
+ #include "gx_stream_common.h"
+ #include "gx_cp_decode.h"
+ #include "isa/big_endian.h"
++#include "runtime_log.h"
+ 
++#include <chrono>
++#include <cstdio>
+ #include <cstdlib>
+ #include <unordered_map>
+ 
+@@ -1283,6 +1286,73 @@
+     return ok;
+ }
+ 
++// Quest-3 diagnostics (AURORA_GX_DEBUG bit 8192, the same bit as aurora's "deindex stats"): wall
++// time spent in GX__CallDisplayList per second, so the HLE display-list path can be set against
++// aurora's fifo::process figure. One log line per second; nothing runs without the bit.
++namespace {
++struct DlHleStats {
++    using Clock = std::chrono::steady_clock;
++    bool enabled = false;
++    uint64_t nanos = 0;
++    uint64_t auroraNanos = 0;
++    uint32_t calls = 0;
++    Clock::time_point lastLog{};
++    DlHleStats() {
++        const char* value = std::getenv("AURORA_GX_DEBUG");
++        enabled = value != nullptr && (std::strtoul(value, nullptr, 10) & 8192u) != 0;
++        lastLog = Clock::now();
++    }
++};
++DlHleStats& DlHleStatsState() {
++    static DlHleStats s;
++    return s;
++}
++struct DlHleTimer {
++    DlHleStats::Clock::time_point start{};
++    bool active = false;
++    DlHleTimer() {
++        if (DlHleStatsState().enabled) {
++            active = true;
++            start = DlHleStats::Clock::now();
++        }
++    }
++    ~DlHleTimer() {
++        if (!active) return;
++        auto& s = DlHleStatsState();
++        const auto now = DlHleStats::Clock::now();
++        s.nanos += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count());
++        ++s.calls;
++        if (now - s.lastLog >= std::chrono::seconds(1)) {
++            RT_LOGF(RT_TAG_GX, "dl hle stats: %u GXCallDisplayList calls in %.2f ms wall (last %.1f s), of that inside aurora %.2f ms\n",
++                    s.calls, static_cast<double>(s.nanos) / 1.0e6,
++                    std::chrono::duration<double>(now - s.lastLog).count(),
++                    static_cast<double>(s.auroraNanos) / 1.0e6);
++            s.nanos = 0;
++            s.auroraNanos = 0;
++            s.calls = 0;
++            s.lastLog = now;
++        }
++    }
++};
++// Wraps the aurora::GXCallDisplayList calls below so their share can be subtracted.
++struct DlHleAuroraTimer {
++    DlHleStats::Clock::time_point start{};
++    bool active = false;
++    DlHleAuroraTimer() {
++        if (DlHleStatsState().enabled) {
++            active = true;
++            start = DlHleStats::Clock::now();
++        }
++    }
++    ~DlHleAuroraTimer() {
++        if (active) {
++            DlHleStatsState().auroraNanos += static_cast<uint64_t>(
++                std::chrono::duration_cast<std::chrono::nanoseconds>(DlHleStats::Clock::now() - start).count());
++        }
++    }
++};
++} // namespace
++
+ } // namespace
+ 
+ extern "C" void GxNotifyDisplayListMemoryWrite(uint32_t addr, uint32_t size) {
+@@ -1291,6 +1361,7 @@
+ 
+ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes) {
+     if (nbytes == 0 || listAddr == 0) return;
++    const DlHleTimer hleTimer; // bit 8192 only
+     try {
+         const uint8_t* list = static_cast<const uint8_t*>(GuestToHostPtr(listAddr, nbytes));
+         if (!list) return;
+@@ -1312,7 +1383,10 @@
+         if (!mayContainDraw) {
+             EnsureAuroraFrameActive();
+             GXMarkFrameWork();
+-            GXCallDisplayList(list, nbytes);
++            {
++                const DlHleAuroraTimer auroraTimer;
++                GXCallDisplayList(list, nbytes);
++            }
+             // The republish is required even for register-only lists (verified by
+             // experiment: dropping it corrupts in-race geometry decode). It is
+             // instead memoized inside SyncAppliedVtxStateFromHleReal, so a run of
+@@ -1444,7 +1518,10 @@
+             if (flattenApplyOk) {
+                 EnsureAuroraFrameActive();
+                 GXMarkFrameWork();
++                {
++                const DlHleAuroraTimer auroraTimer;
+                 GXCallDisplayList(auroraStream, auroraStreamBytes);
++            }
+                 // No flip back to GX_DIRECT here
+                 SyncAppliedVtxStateFromHleReal();
+                 return;
+@@ -1464,7 +1541,10 @@
+             if (applyOk) {
+                 EnsureAuroraFrameActive();
+                 GXMarkFrameWork();
++                {
++                const DlHleAuroraTimer auroraTimer;
+                 GXCallDisplayList(list, nbytes);
++            }
+ 
+                 SyncAppliedVtxStateFromHleReal();
+                 return;

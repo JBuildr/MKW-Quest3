@@ -27,8 +27,13 @@ $include = @(
     'tools\Invoke-QuestPipeline.ps1', 'tools\New-StandaloneWorkspace.ps1',
     'tools\Quest-Builder.ps1', 'tools\Translate-Game.ps1', 'tools\README.md',
     'patches\0001-android-buildworkspace.patch', 'patches\0002-translator-target-os.patch',
-    'patches\0003-quest-adreno-workaround.patch', 'patches\README.md',
-    'android\AndroidManifest.xml', 'android\build-apk.ps1', 'android\deploy.ps1',
+    'patches\0003-quest-adreno-workaround.patch', 'patches\0004-quest-openxr.patch',
+    'patches\README.md',
+    # Both manifests: build-apk.ps1 picks AndroidManifest.vr.xml for the
+    # immersive APK, which is the only kind the pipeline builds, and the plain
+    # one stays for a hand-made -Shell Panel comparison.
+    'android\AndroidManifest.xml', 'android\AndroidManifest.vr.xml',
+    'android\build-apk.ps1', 'android\deploy.ps1',
     'android\java\org\mkwpc\quest\MkwActivity.java', 'android\res\values\strings.xml',
     'images\main-menu.jpg', 'images\character-select.jpg', 'images\vehicle-select.jpg', 'images\retro-wfc.jpg'
 )

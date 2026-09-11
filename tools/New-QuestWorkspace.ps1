@@ -63,7 +63,7 @@ if (Test-Path -LiteralPath $fiberManager) {
 
 # 0001 targets the BuildWorkspace as shipped; 0003 targets 0001's result (plus Fix AA).
 # 0002 is for the translator source tree, see Regenerate-AndroidTranslation.ps1.
-$patches = @('0001-android-buildworkspace.patch', '0003-quest-adreno-workaround.patch')
+$patches = @('0001-android-buildworkspace.patch', '0003-quest-adreno-workaround.patch', '0004-quest-openxr.patch')
 Push-Location $Workspace
 try {
     foreach ($patch in $patches) {

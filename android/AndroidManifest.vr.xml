@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="org.mkwpc.quest"
+    android:versionCode="1"
+    android:versionName="0.1">
+
+    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="34" />
+
+    <!-- The immersive variant of the manifest, selected with
+         build-apk.ps1 -Shell Immersive. It differs from AndroidManifest.xml in
+         exactly three places: the VR intent category on the launcher
+         intent-filter, the head-tracking uses-feature, and the missing
+         <layout> element (an immersive app has no 2D panel to size).
+         Those three markers are what this project has always intended to use
+         to ask Horizon OS for an immersive app; they have not been checked
+         against Meta's platform documentation on this machine, so if the
+         headset launches the app as a panel anyway or refuses to install it,
+         the set is what to question first. AndroidManifest.xml stays in the
+         tree as the fallback: it is a complete, working panel shell, and
+         switching back to it is one argument on the packaging script. -->
+
+    <uses-feature android:name="android.hardware.vr.headtracking"
+        android:version="1" android:required="true" />
+    <uses-feature android:name="android.hardware.gamepad" android:required="false" />
+    <uses-feature android:glEsVersion="0x00030002" android:required="false" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- Retro WFC online play: the runtime opens plain sockets for the game. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- The runtime reads a ~2.6 GB extracted disc plus a ~2 GB mod overlay
+         from a plain directory. Android 11 closed /sdcard/Android/data/<pkg>
+         to adb for writing, so that is the only place both the host and the
+         app can reach. Granted from the host with
+         "appops set <pkg> MANAGE_EXTERNAL_STORAGE allow"; it is a sideload
+         permission, not something a store build would ask for. -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+    <application
+        android:label="@string/app_name"
+        android:allowBackup="false"
+        android:debuggable="true"
+        android:hasCode="true"
+        android:extractNativeLibs="true"
+        android:resizeableActivity="true">
+
+        <!-- Horizon OS reads this to decide whether the app may run on a given
+             headset. -->
+        <meta-data android:name="com.oculus.supportedDevices"
+            android:value="quest2|questpro|quest3|quest3s" />
+
+        <activity
+            android:name=".MkwActivity"
+            android:label="@string/app_name"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:resizeableActivity="true"
+            android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+            android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenSize|screenLayout|uiMode|density">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="com.oculus.intent.category.VR" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

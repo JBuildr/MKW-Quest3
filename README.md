@@ -15,6 +15,7 @@
 <p align="center"><b>Mario Kart Wii on the Meta Quest 3, built from your own disc.</b></p>
 <p align="center">
   Native arm64 build through WiiCompiled's static recompilation, rendered by aurora on Vulkan.<br>
+  A real VR app: menus hang in your room as a flat screen, races are rendered per eye from the driver's seat.<br>
   Retro Rewind supported. No game data in this repository, ever.
 </p>
 
@@ -54,6 +55,7 @@
 | [Rules of the Track](#rules-of-the-track) | what you bring, what this repository never contains |
 | [Starting Grid](#starting-grid-what-your-pc-needs) | what your PC needs |
 | [Grand Prix](#grand-prix-building-the-apk) | building the APK, lap by lap |
+| [Cockpit](#cockpit-controls-and-the-vr-menu) | controls, and every dial in the in-headset menu |
 | [Pit Lane](#pit-lane-what-happens-under-the-hood) | what the scripts do |
 | [Pit Stop](#pit-stop-updating-retro-rewind) | updating Retro Rewind |
 | [Tuning](#tuning-switches-without-rebuilding) | switches without rebuilding |
@@ -93,7 +95,25 @@ in that collaboration; every result was verified on the headset.
 | 1st | 3D models (characters, karts, wheels, trophies, Miis) | Finished since 2026-09-07 |
 | 1st | Video panels in the main-menu buttons | Finished since 2026-09-08 (same driver fault, direct vertex formats with an odd stride) |
 | 1st | Online play (Retro WFC) | Finished since 2026-09-08, see [Pit Stop](#pit-stop-updating-retro-rewind) |
-| 2nd | Races on the track | Running, 18 to 30 fps with 12 karts, 45 fps in time trials. The CPU expansion of the workaround costs about half; still on the track |
+| 2nd | Races on the track | Running, 36 fps on the starting grid with all 12 karts in view, 40 to 60 fps once the field spreads out (was 18 to 25 until 2026-09-09). Below 60 fps the game itself runs slower than real time; the remaining cost is measured, see the Tuning bits |
+| 1st | Immersive app, flat screen in the room | Finished. The app takes the whole display; menus are a screen standing in your room, size, distance and height adjustable |
+| 1st | Per-eye rendering in local races | Finished. Own projection per eye from the headset's own field of view, head rotation and head movement both applied. The switch between screen and per-eye is automatic and comes from the game's own section id, not from a guess |
+| 2nd | Per-eye rendering online | Not yet. Online races stay the flat screen in your room; see the note below |
+| 1st | First-person seat | Finished since 2026-09-11. The eye sits where the game puts the driver's head: the head bone was read out of the driver's skeleton and measured at 54 game units above the kart's origin. No invented metre, no world scale. The driver can be taken out of the picture while the kart stays |
+| 1st | Touch controllers | Finished. A full GameCube pad, mapped from what the buttons actually do in game rather than from a layout diagram, see [Cockpit](#cockpit-controls-and-the-vr-menu) |
+| 2nd | Motion controls (shake to trick, tilt to steer) | Not started. The game is either a GameCube pad or a Wii Remote, so this is a mode switch rather than an addition |
+
+> **Yellow flag: full VR is local play only, for now.** Online races stay the
+> flat screen standing in your room -- still immersive, still head-tracked, but
+> not per eye. The reason is deliberate rather than broken. The app does not
+> guess when you are racing; it reads the game's own section id, and exactly one
+> section has been measured on the headset from start to finish: the local race,
+> id 30. Time trials, battle and online almost certainly carry ids of their own,
+> and an id nobody has watched is treated as *not racing* and logged once. The
+> flat screen is the safe answer, because a camera placed inside a menu -- or
+> inside a mode that turns out to draw differently -- is somewhere nobody wants
+> to be, especially with a headset on. The list grows from measurements, not
+> from guesses; each new id costs one race and one log line.
 
 > **Lakitu's note on the Adreno 740.** The Quest 3's shader compiler
 > miscomputes the storage-buffer word address
@@ -103,10 +123,11 @@ in that collaboration; every result was verified on the headset.
 > works around it by expanding such draws on the CPU into a 4-byte-aligned
 > direct vertex layout, where every address term is a multiple of 4. The
 > workaround is on by default for Android and can be switched off in
-> `Config.toml` for comparison (`[debug] aurora_deindex = false`). It costs
-> CPU time in races; a GPU-side formulation that avoids the miscompile is the
-> next thing to try. The compute-shader reproduction that pins the fault
-> ships with the build (`[debug] aurora_gx_debug = 2048`).
+> `Config.toml` for comparison (`[debug] aurora_deindex = false`). Measured
+> on the headset, the expansion itself costs about 3.6 ms per frame with all
+> 12 karts in view (14 000 draws); a per-draw diagnostic string that used to
+> sit next to it cost 10 ms and is gone. The compute-shader reproduction that
+> pins the fault ships with the build (`[debug] aurora_gx_debug = 2048`).
 
 ---
 
@@ -197,9 +218,16 @@ Nothing here helps you obtain any of that.
    **"Install on Quest"**. The first push copies several GB of game data to
    `/sdcard/MKW`; later installs without the tick only replace the app.
 9. **Start the app** from the headset's app library under *Unknown sources*.
-   Every start begins with the shader compilation: the screen stays on the
-   loading picture for up to a minute before the game appears. That is
-   normal, wait it out.
+   It opens straight into VR: the menus as a screen standing in your room, the
+   race per eye from the driver's seat. Nothing has to be switched on first.
+
+> **The first minutes stutter, and that is on purpose.** Shaders are compiled
+> as the game asks for them, and this build waits for them instead of skipping
+> the draw. Skipping keeps the frame rate up but loses anything the game bakes
+> once into a texture -- several vehicle preview pictures came out black and
+> stayed black until the app was restarted. A stutter heals itself; a black
+> bake does not. Once the cache is warm it is gone, and the trade is a tick in
+> the in-headset menu (*Skip draws while shaders compile*).
 
 > **Item box.** Updates later are short: **Get / update Retro Rewind**, then
 > **Build APK** (minutes), then **Install on Quest** without the tick.
@@ -223,8 +251,71 @@ The same pipeline runs from a terminal:
 ```
 
 Start the app from the headset's app library (unknown sources). Starting it
-with `adb shell am start` is not useful: Horizon OS pauses the panel at once.
+with `adb shell am start` is not useful: Horizon OS suspends an app it did not
+launch itself.
 Logs: `adb logcat -s mkw`.
+
+---
+
+## Cockpit: controls and the VR menu
+
+### What each button does
+
+Read out of the game and then confirmed by playing a race, which is worth saying
+because the first version of this table was written from a GameCube layout
+diagram and had three of its six rows wrong.
+
+| Touch controller | In a race | In the menus |
+|---|---|---|
+| Left thumbstick | Steer | Move the cursor |
+| **Left trigger** | Brake, reverse, and the drift hop | **Back / cancel** |
+| **Right trigger** | Accelerate | **Confirm** |
+| **Grip, either hand** | **Trick** | Cursor up |
+| Right thumbstick | Trick, with a direction | Move the cursor |
+| **Right A or B** | **Use an item** | — |
+| Left X or Y | Look behind | — |
+| Left menu button, short press | Pause | Pause |
+| Left menu button, held 0.5 s | Open the VR menu | Open the VR menu |
+
+**Why the grip is the trick button.** A trick is a single D-pad edge, and there
+are moments where it has to land on a beat -- a POW block about to go off is the
+one everybody knows. A finger already curled around the grip hits that; a thumb
+that has to find a stick and flick it does not.
+
+**Why braking and drifting share one control.** Because the game reads them as
+one. `B` and `R` are a single mask to Mario Kart Wii, and what you get is decided
+by the throttle, not by the button: with the accelerator held, a fresh press is a
+hop; without it, the same press brakes and then reverses. No mapping can separate
+them, so the left trigger carries all three and the grip is free for the trick.
+
+Three controller profiles are bound (`oculus/touch_controller`,
+`meta/touch_controller_plus`, `meta/touch_controller_quest_2`) plus the Khronos
+simple fallback. Binding only one is not enough -- a runtime that picks a
+different name for the same hardware then reports a controller with no bindings,
+which looks exactly like a controller that was not detected.
+
+If a real gamepad is plugged in, it keeps port 0 and the Touch controllers move
+to port 1, where this game does not read them. The pad wins, silently and
+completely.
+
+### The VR menu
+
+**Hold the left menu button for half a second.** A short press is pause; only the
+long press opens this. Every dial takes effect immediately and is written back to
+`Config.toml`, so nothing has to be set twice.
+
+| Dial | What it does |
+|---|---|
+| **Mode** | *Cinema* is the flat screen in your room, *Stereo* renders the race per eye. Stereo is the default and switches to the flat screen for menus by itself |
+| **First-person seat** | On puts the eye where the driver's head is. Off leaves it on the game's own chase camera, in stereo, with the head free to look around -- a way of playing in its own right, not a fallback |
+| **Seat height** / **Seat forward** | Trim the seat, in the game's own units along the kart's axes. They start at the measured head position (54.0 and -2.0), so they trim an answer rather than search for one |
+| **Hide driver** | Takes the driver out of the picture and leaves the kart in it. From the seat, his head is otherwise in front of your eye |
+| **Scale** / **Vertical offset** | The HUD. A HUD drawn for a television lands at the edge of vision in a headset, so it is pulled towards the centre. Its depth is deliberately never touched |
+| **World scale** | How many game units make a metre, for your head's own movement. Not derivable, so it is measured by standing in the world and looking |
+| **Head movement** | How much of your head's movement (not its rotation) reaches the game camera |
+| **Recentre now** | Takes your current heading as forward. Entering stereo does this by itself |
+| **Distance** / **Height** / **Width** / **Height (size)** | The screen in your room, in metres |
+| **Skip draws while shaders compile** | Off by default here, see the note in Lap 3 |
 
 ---
 
@@ -232,10 +323,10 @@ Logs: `adb logcat -s mkw`.
 
 | Step | Script | What it does |
 |---|---|---|
-| 1 | `tools\New-StandaloneWorkspace.ps1` | `git clone` of WiiCompiled at `e6f9b21`, Fix AA, patches `0001` to `0003`, `dotnet build` of the translator |
+| 1 | `tools\New-StandaloneWorkspace.ps1` | `git clone` of WiiCompiled at `e6f9b21`, Fix AA, patches `0001` to `0004`, `dotnet build` of the translator |
 | 2 | `tools\Import-DiscImage.ps1` | `nodtool info` (game ID), `nodtool extract` to `GameAssets\DATA`, hash check, `Assets\main.dol` + `StaticR.rel` |
 | 3 | `tools\Translate-Game.ps1` | `translate-recursive`, `emit-base-manifest`, optional `translate-mod` (Retro Rewind), `generate-data-init`, `emit-build-shards`, all with `--target-os android` |
-| 4 | `tools\Build-Quest.ps1` | CMake with the NDK toolchain (`arm64-v8a`, `android-34`, prebuilt Dawn for Android), Ninja, APK packaging without Gradle |
+| 4 | `tools\Build-Quest.ps1` | CMake with the NDK toolchain (`arm64-v8a`, `android-34`, prebuilt Dawn for Android), Ninja, APK packaging without Gradle. The APK is always the immersive one: the choice between a flat screen in the room and per-eye rendering is made inside the app, not at build time |
 | 5 | `android\deploy.ps1` | `adb install`, `appops` storage grant, push of `DATA` and Retro Rewind to `/sdcard/MKW`, `Config.toml` |
 
 `nodtool` comes from [encounter/nod](https://github.com/encounter/nod)
@@ -293,13 +384,45 @@ needs the rebuild.
 
 ## Tuning: switches without rebuilding
 
-`/sdcard/MKW/WiiCompiled/Config.toml` accepts a `[debug]` section:
+Everything in the in-headset menu is written to
+`/sdcard/MKW/WiiCompiled/Config.toml`, and everything in that file can also be
+edited by hand. The defaults below are what a fresh install gets -- none of them
+have to be typed in.
+
+```toml
+[video]
+resolution_multiplier = 3.0   # the game renders at the Wii's own 640x528; stretched across a
+                              # headset that is a factor of 2.6, so it is rendered larger instead.
+                              # Measured: 52 to 61 fps at 3.0, for nine times the pixels
+skip_unready_pipelines = false # wait for a shader rather than drop the draw. See Lap 3
+
+[vr]
+mode = "stereo"               # "stereo" races per eye and keeps menus flat; "cinema" is the flat
+                              # screen everywhere; "panel" starts no VR session at all
+ego_camera = true             # the eye in the driver's place; false is the game's chase camera
+seat_height = 54.0            # where the driver's head sits above the kart's origin, in game
+seat_forward = -2.0           # units along the kart's own axes. Measured, not chosen
+hide_driver = true            # the driver leaves the picture, the kart stays
+hud_scale = 0.38              # the HUD pulled towards the centre of vision
+hud_offset_y = 0.0
+world_scale = 100.0           # game units per metre, for your own head's movement
+head_translation = 0.0        # how much of that movement reaches the game camera
+screen_distance = 2.5         # the screen in your room, in metres
+screen_width = 3.2
+screen_height = 1.8
+```
+
+The `[debug]` section is for looking into the renderer rather than playing:
 
 ```toml
 [debug]
 aurora_deindex = true      # the Adreno workaround; false shows the driver fault
-aurora_gx_debug = 0        # renderer diagnostics bit mask (2048 = compute-shader reproduction of the driver fault)
+aurora_gx_debug = 0        # renderer diagnostics bit mask: 2048 = compute-shader reproduction of the driver fault,
+                           # 8192 = one log line per second with the per-frame cost of the workaround (adb logcat -s mkw),
+                           # 16384 (with 8192) = also count how many expanded draws repeat between frames
 dawn_validation = false
+vr_debug = 0               # bit 0 = one timing line per second from the OpenXR side,
+                           # bit 2 = the driver's-head probe, for working on the seat
 ```
 
 ---
@@ -308,7 +431,7 @@ dawn_validation = false
 
 | Path | Contents |
 |---|---|
-| `patches/` | the three patches against WiiCompiled `e6f9b21`: Android target, translator `--target-os`, the Quest renderer work (Adreno workaround, JNI guard, debug switches) |
+| `patches/` | the four patches against WiiCompiled `e6f9b21`: Android target, translator `--target-os`, the Quest renderer work (Adreno workaround, JNI guard, debug switches), and the OpenXR side (immersive session, per-eye rendering, the seat, the controllers, the in-headset menu) |
 | `android/` | manifest, Java activity, packaging and deploy scripts |
 | `tools/` | pipeline scripts, the GUI, the release packer |
 | `.github/workflows/` | the release workflow: a tag `v*` packs the release archive and publishes it |

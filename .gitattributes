@@ -1,0 +1,13 @@
+# Line endings. The build scripts are PowerShell on Windows, the sources the
+# patches touch are LF upstream.
+* text=auto
+
+# Patch files must stay LF in the working tree. git apply matches context bytes
+# against the LF sources of the pinned base commit, and the patches are checked
+# for byte-identity after regeneration; a CRLF checkout breaks both. Without
+# this rule core.autocrlf=true rewrites them on the next clone.
+*.patch -text
+
+# PowerShell keeps CRLF, which is what every editor on Windows writes anyway.
+*.ps1 text eol=crlf
+*.cmd text eol=crlf

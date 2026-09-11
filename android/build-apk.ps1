@@ -4,6 +4,11 @@ param(
     [string]$Sdk = "$env:LOCALAPPDATA\Android\Sdk",
     [string]$BuildToolsVersion = '35.0.0',
     [string]$Platform = 'android-34',
+    # Which shell the APK asks Horizon OS for: Panel is the flat 2D window, so
+    # an APK built without this parameter is the same one as before OpenXR
+    # existed; Immersive is the OpenXR app. There is no manifest merger here,
+    # the two manifests are complete files and this picks one of them.
+    [ValidateSet('Panel', 'Immersive')] [string]$Shell = 'Panel',
     [Parameter(Mandatory)] [string]$NativeLibrary,   # libmain.so for arm64-v8a
     # Anything libmain.so lists as NEEDED that Android does not already provide
     # (libpng16.so here; libz.so is a system library).
@@ -21,7 +26,11 @@ Set-StrictMode -Version 3.0
 
 $tools = Join-Path $Sdk "build-tools\$BuildToolsVersion"
 $androidJar = Join-Path $Sdk "platforms\$Platform\android.jar"
-foreach ($required in @($tools, $androidJar, $NativeLibrary, $SdlSourceDir)) {
+$manifestName = if ($Shell -eq 'Immersive') { 'AndroidManifest.vr.xml' } else { 'AndroidManifest.xml' }
+$manifest = Join-Path $PSScriptRoot $manifestName
+# The manifest is guarded like every other input: aapt2 reports a missing
+# --manifest as a generic link failure, which reads like a resource problem.
+foreach ($required in @($tools, $androidJar, $manifest, $NativeLibrary, $SdlSourceDir)) {
     if (-not (Test-Path -LiteralPath $required)) { throw "Not found: $required" }
 }
 
@@ -40,7 +49,7 @@ if ($LASTEXITCODE -ne 0) { throw 'aapt2 compile failed' }
 
 $unsigned = Join-Path $work 'unsigned.apk'
 & $aapt2 link -o $unsigned -I $androidJar `
-    --manifest "$PSScriptRoot\AndroidManifest.xml" `
+    --manifest $manifest `
     --java "$work\gen" `
     "$work\res.zip"
 if ($LASTEXITCODE -ne 0) { throw 'aapt2 link failed' }

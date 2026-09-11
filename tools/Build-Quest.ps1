@@ -14,6 +14,11 @@ param(
     [int]$Jobs = 0,
     # RetroRewind (needs the translated mod) or WiiCompiled (the base game).
     [ValidateSet('RetroRewind', 'WiiCompiled')] [string]$Product = 'RetroRewind',
+    # Which shell the APK asks Horizon OS for. Panel is the flat 2D window and
+    # stays the default, so an existing command line keeps building the same
+    # APK; Immersive packages the OpenXR manifest instead. The native library
+    # is the same one either way, only the manifest differs.
+    [ValidateSet('Panel', 'Immersive')] [string]$Shell = 'Panel',
     [switch]$SkipConfigure,
     [switch]$SkipApk
 )
@@ -88,9 +93,37 @@ if ($SkipApk) { return }
 # translated game code and must not land inside this repository (Fix AD).
 $packaging = Join-Path $repoRoot 'android\build-apk.ps1'
 $apkDir = Join-Path $Workspace 'android\out'
+
+# Nothing scans the build directory for shared libraries: what is not in this
+# list is not in the APK, and the app then dies at load time on a NEEDED entry
+# the linker cannot resolve. The OpenXR loader is fetched and built as part of
+# the CMake step, whose _deps directory layout is not ours to predict, so CMake
+# exports the finished .so in the cache variable MKW_OPENXR_LOADER_SO and it is
+# read back from there rather than spelled out here.
+$extraLibraries = @(Join-Path $buildDir '_deps\png-build\libpng16.so')
+$loaderSo = ''
+$cacheFile = Join-Path $buildDir 'CMakeCache.txt'
+if (Test-Path -LiteralPath $cacheFile) {
+    $cacheEntry = Select-String -LiteralPath $cacheFile -Pattern '^MKW_OPENXR_LOADER_SO(?::[A-Z]+)?=(.*)$' |
+        Select-Object -First 1
+    if ($cacheEntry) { $loaderSo = $cacheEntry.Matches[0].Groups[1].Value.Trim() }
+}
+if ($loaderSo -and (Test-Path -LiteralPath $loaderSo)) {
+    $extraLibraries += $loaderSo
+    Write-Host "Packaging the OpenXR loader: $(Split-Path -Leaf $loaderSo)"
+} else {
+    $reason = "MKW_OPENXR_LOADER_SO is not in $cacheFile"
+    if ($loaderSo) { $reason = "MKW_OPENXR_LOADER_SO points at a file that does not exist: $loaderSo" }
+    # With -Shell Immersive there is no APK worth writing without it, so this is
+    # fatal there instead of a headset-side "dlopen failed" half an hour later.
+    if ($Shell -eq 'Immersive') { throw "$reason. Reconfigure so the OpenXR loader is built, or package with -Shell Panel." }
+    Write-Host "No OpenXR loader in the APK ($reason)."
+}
+
 & $packaging -Sdk $Sdk -BuildToolsVersion $BuildToolsVersion -Platform $Platform `
+    -Shell $Shell `
     -NativeLibrary $library `
-    -ExtraLibraries (Join-Path $buildDir '_deps\png-build\libpng16.so') `
+    -ExtraLibraries $extraLibraries `
     -SdlSourceDir (Join-Path $buildDir '_deps\sdl-src') `
     -OutputDirectory $apkDir
 Write-Host "APK: $(Join-Path $apkDir 'mkw-quest.apk')"

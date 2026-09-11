@@ -51,7 +51,7 @@ if (Test-Path -LiteralPath $fiberManager) {
     }
 }
 
-$patchOrder = @('0001-android-buildworkspace.patch', '0002-translator-target-os.patch', '0003-quest-adreno-workaround.patch')
+$patchOrder = @('0001-android-buildworkspace.patch', '0002-translator-target-os.patch', '0003-quest-adreno-workaround.patch', '0004-quest-openxr.patch')
 foreach ($patch in $patchOrder) {
     $path = Join-Path $PatchDirectory $patch
     if (-not (Test-Path -LiteralPath $path)) { throw "Patch not found: $path" }

@@ -106,6 +106,19 @@ if ($hasRetro) {
 
 # Written only when absent, so a Config.toml the user edited (window size,
 # [debug] switches) survives redeploys.
+#
+# Deliberately only the paths and the window: everything else, [vr] included,
+# is left out so that the runtime's own defaults apply and there is exactly one
+# place those are written down. This file cannot simply be skipped instead --
+# the runtime's template ships commented-out Windows example paths, so without
+# these two lines the app has no idea where the game data is.
+#
+# The consequence is worth knowing, because it cost a confusing evening once: on
+# Android the runtime's full commented template NEVER reaches the device, since
+# this file exists before the runtime could write one. Anything missing here
+# falls back to the built-in default rather than appearing as a commented line
+# to edit. The settings that matter are all in the in-headset menu, which writes
+# them back into this file the first time they are touched.
 $configRemote = "$remote/WiiCompiled/Config.toml"
 $exists = & $Adb shell "test -f $configRemote && echo yes"
 if ("$exists".Trim() -ne 'yes') {

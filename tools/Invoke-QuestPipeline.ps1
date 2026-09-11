@@ -16,6 +16,14 @@ param(
     [string]$Sdk = "$env:LOCALAPPDATA\Android\Sdk",
     # Parallel compiles for the native build; 0 = from free memory (Build-Quest.ps1).
     [int]$Jobs = 0,
+    # No shell choice here on purpose. This pipeline builds the immersive APK and
+    # nothing else, because the choice a player actually wants is INSIDE the app:
+    # an immersive build can show the game as a flat screen standing in the room
+    # OR render it per eye from the driver's place, and it switches between them
+    # by itself. A "panel" APK is a different thing entirely -- a flat window in
+    # the headset's own shell that starts happily and simply cannot do VR at all.
+    # Offering that as a build option only ever produced an APK somebody then had
+    # to debug. Build-Quest.ps1 still takes -Shell Panel directly, for comparing.
     [switch]$Install,
     [switch]$PushAssets,
     # Skip the build and only install what <Workspace>\android\out already holds.
@@ -133,8 +141,8 @@ if (-not $InstallOnly) {
         }
     }
 
-    Step "Build and package ($product)"
-    & (Join-Path $tools 'Build-Quest.ps1') -Workspace $Workspace -Sdk $Sdk -Toolkit $Toolkit -Jobs $Jobs -Product $product
+    Step "Build and package ($product, immersive)"
+    & (Join-Path $tools 'Build-Quest.ps1') -Workspace $Workspace -Sdk $Sdk -Toolkit $Toolkit -Jobs $Jobs -Product $product -Shell Immersive
 }
 
 if ($Install -or $InstallOnly) {
