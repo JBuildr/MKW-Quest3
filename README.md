@@ -15,7 +15,7 @@
 <p align="center"><b>Mario Kart Wii on the Meta Quest 3, built from your own disc.</b></p>
 <p align="center">
   Native arm64 build through WiiCompiled's static recompilation, rendered by aurora on Vulkan.<br>
-  A real VR app: menus hang in your room as a flat screen, races are rendered per eye from the driver's seat.<br>
+  A real VR app: menus hang in your room as a flat screen, the race is a world-locked view from the driver's seat.<br>
   Retro Rewind supported. No game data in this repository, ever.
 </p>
 
@@ -97,15 +97,26 @@ in that collaboration; every result was verified on the headset.
 | 1st | Online play (Retro WFC) | Finished since 2026-09-08, see [Pit Stop](#pit-stop-updating-retro-rewind) |
 | 2nd | Races on the track | Running, 36 fps on the starting grid with all 12 karts in view, 40 to 60 fps once the field spreads out (was 18 to 25 until 2026-09-09). Below 60 fps the game itself runs slower than real time; the remaining cost is measured, see the Tuning bits |
 | 1st | Immersive app, flat screen in the room | Finished. The app takes the whole display; menus are a screen standing in your room, size, distance and height adjustable |
-| 1st | Per-eye rendering in local races | Finished. Own projection per eye from the headset's own field of view, head rotation and head movement both applied. The switch between screen and per-eye is automatic and comes from the game's own section id, not from a guess |
-| 2nd | Per-eye rendering online | Not yet. Online races stay the flat screen in your room; see the note below |
+| 1st | World-locked race view | Finished. The race is handed to the compositor as a projection layer through the headset's own field of view, with head rotation and head movement applied to the game's camera. The switch between screen and world view is automatic and comes from the game's own section id, not from a guess. **Both eyes receive the same image**: there is no per-eye offset yet, so this is not binocular depth -- see the note below |
+| 2nd | Per-eye offset (real stereoscopy) | Not yet. One image is rendered and submitted to both eyes. Adding a true per-eye offset roughly doubles the rendering cost, so it waits until the frame rate has room |
+| 2nd | World-locked race view online | Not yet. Online races stay the flat screen in your room; see the note below |
 | 1st | First-person seat | Finished since 2026-09-11. The eye sits where the game puts the driver's head: the head bone was read out of the driver's skeleton and measured at 54 game units above the kart's origin. No invented metre, no world scale. The driver can be taken out of the picture while the kart stays |
 | 1st | Touch controllers | Finished. A full GameCube pad, mapped from what the buttons actually do in game rather than from a layout diagram, see [Cockpit](#cockpit-controls-and-the-vr-menu) |
 | 2nd | Motion controls (shake to trick, tilt to steer) | Not started. The game is either a GameCube pad or a Wii Remote, so this is a mode switch rather than an addition |
 
+> **What "VR" means here, precisely.** The race is a world-locked projection
+> layer: the game's own camera gets your head's rotation and movement, and the
+> picture is drawn through the headset's real field of view, so looking around
+> works and the world stays put when you move. What it is *not*, yet, is
+> stereoscopic: one image is rendered and handed to both eyes with the same pose
+> and the same field of view, so there is no binocular parallax. Depth comes from
+> motion and from the field of view, not from your two eyes disagreeing. A true
+> per-eye offset is the obvious next step and roughly doubles what the GPU draws,
+> which is why it waits behind the frame rate rather than in front of it.
+
 > **Yellow flag: full VR is local play only, for now.** Online races stay the
 > flat screen standing in your room -- still immersive, still head-tracked, but
-> not per eye. The reason is deliberate rather than broken. The app does not
+> not the world-locked view. The reason is deliberate rather than broken. The app does not
 > guess when you are racing; it reads the game's own section id, and exactly one
 > section has been measured on the headset from start to finish: the local race,
 > id 30. Time trials, battle and online almost certainly carry ids of their own,
@@ -219,7 +230,8 @@ Nothing here helps you obtain any of that.
    `/sdcard/MKW`; later installs without the tick only replace the app.
 9. **Start the app** from the headset's app library under *Unknown sources*.
    It opens straight into VR: the menus as a screen standing in your room, the
-   race per eye from the driver's seat. Nothing has to be switched on first.
+   race as a world-locked view from the driver's seat. Nothing has to be
+   switched on first.
 
 > **The first minutes stutter, and that is on purpose.** Shaders are compiled
 > as the game asks for them, and this build waits for them instead of skipping
@@ -306,7 +318,7 @@ long press opens this. Every dial takes effect immediately and is written back t
 
 | Dial | What it does |
 |---|---|
-| **Mode** | *Cinema* is the flat screen in your room, *Stereo* renders the race per eye. Stereo is the default and switches to the flat screen for menus by itself |
+| **Mode** | *Cinema* is the flat screen in your room everywhere, *Stereo* puts the race into the world. Stereo is the default and switches back to the flat screen for menus by itself |
 | **First-person seat** | On puts the eye where the driver's head is. Off leaves it on the game's own chase camera, in stereo, with the head free to look around -- a way of playing in its own right, not a fallback |
 | **Seat height** / **Seat forward** | Trim the seat, in the game's own units along the kart's axes. They start at the measured head position (54.0 and -2.0), so they trim an answer rather than search for one |
 | **Hide driver** | Takes the driver out of the picture and leaves the kart in it. From the seat, his head is otherwise in front of your eye |
@@ -326,7 +338,7 @@ long press opens this. Every dial takes effect immediately and is written back t
 | 1 | `tools\New-StandaloneWorkspace.ps1` | `git clone` of WiiCompiled at `e6f9b21`, Fix AA, patches `0001` to `0004`, `dotnet build` of the translator |
 | 2 | `tools\Import-DiscImage.ps1` | `nodtool info` (game ID), `nodtool extract` to `GameAssets\DATA`, hash check, `Assets\main.dol` + `StaticR.rel` |
 | 3 | `tools\Translate-Game.ps1` | `translate-recursive`, `emit-base-manifest`, optional `translate-mod` (Retro Rewind), `generate-data-init`, `emit-build-shards`, all with `--target-os android` |
-| 4 | `tools\Build-Quest.ps1` | CMake with the NDK toolchain (`arm64-v8a`, `android-34`, prebuilt Dawn for Android), Ninja, APK packaging without Gradle. The APK is always the immersive one: the choice between a flat screen in the room and per-eye rendering is made inside the app, not at build time |
+| 4 | `tools\Build-Quest.ps1` | CMake with the NDK toolchain (`arm64-v8a`, `android-34`, prebuilt Dawn for Android), Ninja, APK packaging without Gradle. The APK is always the immersive one: the choice between a flat screen in the room and the world-locked race view is made inside the app, not at build time |
 | 5 | `android\deploy.ps1` | `adb install`, `appops` storage grant, push of `DATA` and Retro Rewind to `/sdcard/MKW`, `Config.toml` |
 
 `nodtool` comes from [encounter/nod](https://github.com/encounter/nod)
@@ -397,7 +409,7 @@ resolution_multiplier = 3.0   # the game renders at the Wii's own 640x528; stret
 skip_unready_pipelines = false # wait for a shader rather than drop the draw. See Lap 3
 
 [vr]
-mode = "stereo"               # "stereo" races per eye and keeps menus flat; "cinema" is the flat
+mode = "stereo"               # "stereo" puts the race in the world, menus stay flat; "cinema" is the flat
                               # screen everywhere; "panel" starts no VR session at all
 ego_camera = true             # the eye in the driver's place; false is the game's chase camera
 seat_height = 54.0            # where the driver's head sits above the kart's origin, in game
@@ -431,7 +443,7 @@ vr_debug = 0               # bit 0 = one timing line per second from the OpenXR 
 
 | Path | Contents |
 |---|---|
-| `patches/` | the four patches against WiiCompiled `e6f9b21`: Android target, translator `--target-os`, the Quest renderer work (Adreno workaround, JNI guard, debug switches), and the OpenXR side (immersive session, per-eye rendering, the seat, the controllers, the in-headset menu) |
+| `patches/` | the four patches against WiiCompiled `e6f9b21`: Android target, translator `--target-os`, the Quest renderer work (Adreno workaround, JNI guard, debug switches), and the OpenXR side (immersive session, projection layers, the seat, the controllers, the in-headset menu) |
 | `android/` | manifest, Java activity, packaging and deploy scripts |
 | `tools/` | pipeline scripts, the GUI, the release packer |
 | `.github/workflows/` | the release workflow: a tag `v*` packs the release archive and publishes it |
